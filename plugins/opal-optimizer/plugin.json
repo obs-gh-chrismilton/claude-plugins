@@ -1,0 +1,11 @@
+{
+  "name": "opal-optimizer",
+  "version": "2.0.0",
+  "description": "Autonomous OPAL query optimization loop. Iteratively rewrites queries, measures execution time and efficiency, keeps improvements, discards regressions.",
+  "skills": [
+    {
+      "name": "opal-optimizer",
+      "path": "skills/opal-optimizer"
+    }
+  ]
+}

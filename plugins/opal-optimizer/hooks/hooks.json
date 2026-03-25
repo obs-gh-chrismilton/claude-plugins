@@ -1,0 +1,15 @@
+[
+  {
+    "event": "PreToolUse",
+    "hooks": [
+      {
+        "type": "command",
+        "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/safety_gate.py",
+        "timeout": 5000,
+        "matcher": {
+          "tool_name": ["Write", "Edit", "Bash"]
+        }
+      }
+    ]
+  }
+]
