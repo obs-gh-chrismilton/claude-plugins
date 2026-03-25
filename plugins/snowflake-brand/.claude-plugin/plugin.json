@@ -1,11 +1,7 @@
 {
   "name": "snowflake-brand",
-  "version": "1.0.0",
   "description": "Snowflake brand guidelines skill for applying official brand standards to designs, code, presentations, and marketing materials",
-  "skills": [
-    {
-      "name": "snowflake-brand",
-      "path": "skills/snowflake-brand"
-    }
-  ]
+  "author": {
+    "name": "Chris Milton"
+  }
 }
