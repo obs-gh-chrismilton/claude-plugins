@@ -1,15 +1,17 @@
-[
-  {
-    "event": "PreToolUse",
-    "hooks": [
+{
+  "description": "Safety gate hook that prevents destructive operations during OPAL optimization",
+  "hooks": {
+    "PreToolUse": [
       {
-        "type": "command",
-        "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/safety_gate.py",
-        "timeout": 5000,
-        "matcher": {
-          "tool_name": ["Write", "Edit", "Bash"]
-        }
+        "matcher": "Write|Edit|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/safety_gate.py",
+            "timeout": 5000
+          }
+        ]
       }
     ]
   }
-]
+}
