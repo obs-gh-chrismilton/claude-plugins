@@ -1,0 +1,21 @@
+{
+  "name": "chris-plugins",
+  "owner": {
+    "name": "Chris Milton"
+  },
+  "metadata": {
+    "description": "Chris Milton's personal Claude Code plugins"
+  },
+  "plugins": [
+    {
+      "name": "opal-optimizer",
+      "source": "./plugins/opal-optimizer",
+      "description": "Autonomous OPAL query optimization loop for Observe monitors and queries"
+    },
+    {
+      "name": "snowflake-brand",
+      "source": "./plugins/snowflake-brand",
+      "description": "Snowflake brand guidelines for designs, code, presentations, and marketing materials"
+    }
+  ]
+}
