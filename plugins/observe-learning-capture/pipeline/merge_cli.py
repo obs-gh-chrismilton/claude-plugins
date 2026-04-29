@@ -22,12 +22,11 @@ import argparse
 import json
 import os
 import sys
-from datetime import datetime
 from pathlib import Path
 
 from pipeline.merge import merge_candidate, remove_from_pending
 from pipeline.stage import read_pending
-from pipeline.types import Candidate, ClassifierMeta, Provenance
+from pipeline.types import Candidate
 
 
 def main() -> int:
@@ -92,48 +91,11 @@ def main() -> int:
 
 def _record_to_candidate(record: dict) -> Candidate:
     """Reconstruct a Candidate from a YAML pending-file record.
-
-    Prefers Candidate.from_yaml_record() (added in T02 fix) as the primary
-    deserializer. The manual fallback path is defensive — it handles any future
-    case where from_yaml_record is absent (e.g., very old plugin version loaded
-    against a newer test environment), but in normal operation from_yaml_record
-    is always present.
-
-    Args:
-        record: Dict as produced by Candidate.to_yaml_record() and read back
-                from the pending staging file via stage.read_pending().
-
-    Returns:
-        Candidate instance with all fields restored.
+    Delegates to Candidate.from_yaml_record() (added in T02). The id
+    is preserved from the stored record — never recomputed — so the
+    bullet written to ObserveIE.md matches the dedupe contract.
     """
-    # Primary path: use the canonical deserializer on Candidate (T02 fix).
-    # WHY prefer this: it is the single source of truth for deserialization
-    # logic and keeps field mapping in one place (types.py, not here).
-    if hasattr(Candidate, "from_yaml_record"):
-        return Candidate.from_yaml_record(record)
-
-    # Defensive fallback: manual reconstruction mirroring types.py logic.
-    # This branch should never be hit in a correctly installed plugin.
-    src = record["source"]
-    cls_meta = record.get("classifier") or {}
-    return Candidate.create(
-        title=record["title"],
-        fact=record["fact"],
-        proposed_section=record["proposed_section"],
-        confidence=record["confidence"],
-        tags=list(record.get("tags", [])),
-        provenance=Provenance(
-            session_id=src["session_id"],
-            cwd=src["cwd"],
-            captured_at=datetime.fromisoformat(src["captured_at"]),
-            excerpt=src["excerpt"],
-        ),
-        classifier=ClassifierMeta(
-            model=cls_meta.get("model", "unknown"),
-            prompt_version=cls_meta.get("prompt_version", "1.0"),
-            confidence_score=cls_meta.get("confidence_score"),
-        ) if cls_meta else None,
-    )
+    return Candidate.from_yaml_record(record)
 
 
 def _load_config() -> dict:

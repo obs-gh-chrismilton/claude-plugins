@@ -81,6 +81,7 @@ class TestMergeCli(unittest.TestCase):
             self.assertEqual(pending.read_text(encoding="utf-8").strip(), "")
 
     def test_merge_cli_list(self):
+        import io
         with tempfile.TemporaryDirectory() as d:
             d = Path(d)
             pending = d / ".pending.md"
@@ -96,8 +97,21 @@ class TestMergeCli(unittest.TestCase):
                 with mock.patch.object(
                     sys, "argv", ["merge_cli.py", "--list"]
                 ):
-                    rc = main()
-                    self.assertEqual(rc, 0)
+                    captured = io.StringIO()
+                    with mock.patch("sys.stdout", captured):
+                        rc = main()
+            self.assertEqual(rc, 0)
+            output = captured.getvalue()
+            # Both ids should appear
+            self.assertIn(c1.id, output)
+            self.assertIn(c2.id, output)
+            # Tab-separated format: {id}\t{confidence}\t{title}
+            lines = [l for l in output.splitlines() if l]
+            self.assertEqual(len(lines), 2)
+            for line in lines:
+                fields = line.split("\t")
+                self.assertEqual(len(fields), 3)
+                self.assertEqual(fields[1], "high")
 
     def test_merge_cli_unknown_id_returns_1(self):
         with tempfile.TemporaryDirectory() as d:

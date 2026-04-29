@@ -26,24 +26,18 @@ Review and merge, discard, or edit pending learning candidates captured in prior
 
 ## Actions
 
-When the user replies:
+When the user replies, resolve their position references (#1, #2) to the
+actual 8-char hash `id` field from the YAML record (e.g. `a3f7e1c2`).
+**Never pass the table position number to merge_cli — it expects the hash.**
 
-- **`merge N` or `merge all`** — Invoke the merge pipeline for each approved candidate:
-  ```bash
-  cd ~/repos/claude-plugins/plugins/observe-learning-capture
-  python3 -m pipeline.merge_cli --merge ID
-  ```
-  Look up the candidate ID from the table position (ID = position number or explicit ID from the YAML record).
-
-- **`discard N`** — Invoke the discard pipeline:
-  ```bash
-  cd ~/repos/claude-plugins/plugins/observe-learning-capture
-  python3 -m pipeline.merge_cli --discard ID
-  ```
-
-- **`edit N`** — Open the YAML record from `~/.claude/agents/.observeie-pending.md` for the user to edit, save the file, then run the merge pipeline on that candidate.
-
-- **`defer`** — No action. Candidates remain in queue for next session.
+For each approved candidate:
+- `merge N` → `python3 -m pipeline.merge_cli --merge {hash_id}` from
+  `~/repos/claude-plugins/plugins/observe-learning-capture/`
+- `merge all` → loop over all pending records, run `--merge` for each
+- `discard N` → `python3 -m pipeline.merge_cli --discard {hash_id}`
+- `edit N` → open the YAML record from the pending file for the user to
+  edit, save, then `--merge` with the hash id.
+- `defer` → no action; candidates remain in queue for next session.
 
 4. After all actions complete, confirm with: "Merged N, discarded M, deferred K."
 
