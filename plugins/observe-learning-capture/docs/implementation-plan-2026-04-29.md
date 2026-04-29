@@ -2842,31 +2842,50 @@ git -c user.name="Chris Milton" -c user.email="chris.milton@observeinc.com" \
 
 ---
 
-## Task 15: Companion rule in `~/.claude/CLAUDE.md`
+## Task 15: Companion rules in `~/.claude/CLAUDE.md`
 
 **Files:**
 - Modify: `~/.claude/CLAUDE.md` (NOT in the repo — global user config)
 
-This is the rule that tells Claude how to handle the SessionStart pending-review context. Without it, the plugin's stdout block would be invisible to Claude.
+Two complementary rules land here in a single edit:
+
+1. **Broader Observe-knowledge propagation rule** — discipline rule telling Claude that *when it learns something Observe-platform-general*, it should propagate it. (This is what the plugin automates, but the rule makes the human-side discipline explicit too.)
+2. **SessionStart pending-review handler** — the rule that tells Claude how to handle the `=== OBSERVE LEARNING CAPTURE — PENDING REVIEW ===` system-reminder block emitted by the plugin's SessionStart hook. Without it, the plugin's stdout would be invisible to Claude.
+
+Both go into one combined section, inserted as a new top-level section.
 
 - [ ] **Step 1: Read current global CLAUDE.md to find insertion point**
 
 ```bash
-grep -n "## Hard Rules" ~/.claude/CLAUDE.md
+grep -n "## Confirmations I Always Need" ~/.claude/CLAUDE.md
 ```
 
-Confirm it exists. We'll insert a new top-level section between "End-of-Task Hand-Off" and "Confirmations I Always Need".
+Confirm it exists. We'll insert a new top-level section immediately before this line.
 
-- [ ] **Step 2: Insert the rule**
+- [ ] **Step 2: Insert the combined rule section**
 
 Use the Edit tool to insert this new section in `~/.claude/CLAUDE.md` immediately before the `## Confirmations I Always Need` line:
 
 ```markdown
 ---
 
-## Observe Learning Capture — pending review handling
+## Observe Knowledge Propagation
 
-The `observe-learning-capture` plugin auto-stages Observe-platform learnings in `~/.claude/agents/.observeie-pending.md`. At every session start, its hook emits an `=== OBSERVE LEARNING CAPTURE — PENDING REVIEW ===` block into your context.
+Two complementary rules — one human-discipline, one plugin-handler. Both serve the same goal: Observe-platform learnings discovered in any session benefit every future session.
+
+### Rule A — Cross-customer Observe knowledge must propagate
+
+When you discover behavior, gotchas, mutation signatures, error patterns, OPAL syntax quirks, cascade rules, or platform constraints that are **NOT customer-specific** (would help any IE working any tenant), **append them to the appropriate section of `~/.claude/agents/ObserveIE.md` BEFORE marking the task done.**
+
+This is a hard rule, same priority as the verification checklist. The `observe-learning-capture` plugin (when installed and operational) automates the capture, but you must still verify the appropriate section was updated as part of your end-of-task hand-off.
+
+**Customer-specific facts** (tenant IDs, dataset names like `EchoNet/foo`, contacts, customer-named monitors) go to `~/Work/<Customer>/CLAUDE.md`, **NEVER** to ObserveIE.md.
+
+**Non-Observe facts** (general programming patterns, framework knowledge, language quirks) go to neither — they belong in tier-1 docs or your own notes.
+
+### Rule B — Pending-review handling
+
+The `observe-learning-capture` plugin auto-stages Observe-platform learnings in `~/.claude/agents/.observeie-pending.md`. At every session start, its SessionStart hook emits an `=== OBSERVE LEARNING CAPTURE — PENDING REVIEW ===` block into your context.
 
 **When you see that block:**
 
@@ -2886,7 +2905,7 @@ The `observe-learning-capture` plugin auto-stages Observe-platform learnings in 
 
 **Hard constraints:**
 - **NEVER auto-merge** without my explicit approval. The plugin proposes; I dispose.
-- If a candidate looks customer-specific (mentions a tenant ID, a customer-named dataset, a contact), recommend `discard` or `edit` to redirect — those facts go in `~/Work/<Customer>/CLAUDE.md`, not in ObserveIE.md.
+- If a candidate looks customer-specific, recommend `discard` or `edit` to redirect — per Rule A above.
 - If I say `defer`, leave the queue alone — surfaces again next session.
 
 **On `/observe-review` slash command:** same flow, but I invoked it explicitly mid-session.
@@ -2896,7 +2915,7 @@ The `observe-learning-capture` plugin auto-stages Observe-platform learnings in 
 ---
 ```
 
-(The Edit tool call would use the existing `## Confirmations I Always Need` line as the `old_string` anchor and prepend the new section.)
+(The Edit tool call uses the existing `## Confirmations I Always Need` line as the `old_string` anchor and prepends the new section.)
 
 - [ ] **Step 3: Verify the rule is in place**
 
