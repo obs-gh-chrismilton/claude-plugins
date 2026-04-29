@@ -1,0 +1,26 @@
+{
+  "destination_file": "~/.claude/agents/ObserveIE.md",
+  "pending_file": "~/.claude/agents/.observeie-pending.md",
+  "fallback_pending_file": "~/.claude/agents/.observeie-pending.fallback.md",
+  "log_file": "~/.claude/logs/observe-learning-capture.log",
+  "haiku_model": "claude-haiku-4-5-20251001",
+  "prompt_version": "1.0",
+  "prefilter": {
+    "min_turn_chars": 150,
+    "vocabulary_terms": [
+      "OPAL", "Observe", "dataset", "datastream", "monitor", "worksheet",
+      "dashboard", "accelerat", "bookmark", "transform", "filedrop", "poller",
+      "bundle", "pick_col", "make_col", "statsby", "timechart", "deleteDataset",
+      "deleteMonitor", "deleteDashboard", "deleteWorksheet", "deletePoller",
+      "deleteFiledrop", "deleteFolder", "/v1/meta", "GraphQL", "observeinc"
+    ],
+    "discovery_verbs": [
+      "turns out", "actually", "discovered", "it errors", "must be",
+      "won't accept", "cascade", "signature", "requires", "surprisingly",
+      "rejected", "deadlock", "doesn't cascade", "managed by", "non-blocking"
+    ]
+  },
+  "session_end_scan_enabled": true,
+  "stop_scan_enabled": true,
+  "debug": false
+}
