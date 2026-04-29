@@ -26,6 +26,10 @@ See `docs/design.md` for the full design.
 Edit `config.json` to override defaults: destination file paths, model,
 prefilter rules, debug flag.
 
+**Path expansion:** `~` in path values is expanded at runtime by consumers
+via `os.path.expanduser()` (Python) or `eval echo` (shell). Use `~/...` —
+do NOT pre-expand to absolute paths.
+
 ## Manual triggers
 
 - `/observe-review` — review pending queue mid-session

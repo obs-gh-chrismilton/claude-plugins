@@ -16,7 +16,7 @@
     ],
     "discovery_verbs": [
       "turns out", "actually", "discovered", "it errors", "must be",
-      "won't accept", "cascade", "signature", "requires", "surprisingly",
+      "won't accept", "cascade", "surprisingly",
       "rejected", "deadlock", "doesn't cascade", "managed by", "non-blocking"
     ]
   },
