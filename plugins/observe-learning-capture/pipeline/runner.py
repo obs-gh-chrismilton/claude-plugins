@@ -31,7 +31,7 @@ from pathlib import Path
 
 from pipeline.classifier import Classifier
 from pipeline.dedupe import extract_existing_ids, is_duplicate
-from pipeline.stage import append_candidates
+from pipeline.stage import append_candidates, read_pending
 from pipeline.transcript import last_assistant_turn, all_assistant_turns
 
 
@@ -140,10 +140,19 @@ def main() -> int:
         return 0
 
     # ------------------------------------------------------------------
-    # Dedup: filter candidates already merged into ObserveIE.md
+    # Dedup: filter candidates already merged into ObserveIE.md OR already
+    # sitting in the pending queue. Without the pending check, the same
+    # discovery can be staged twice in a long session before the merge step
+    # runs — resulting in duplicate entries that survive into ObserveIE.md.
     # ------------------------------------------------------------------
     existing_ids = extract_existing_ids(destination_path)
-    novel = [c for c in candidates if not is_duplicate(c, existing_ids)]
+    # Also collect IDs of candidates already waiting in the pending file.
+    # WHY: a candidate staged in a prior turn this session has the same id
+    # as one produced by the classifier this turn (id is deterministic from
+    # fact text). Without this check, same-session re-triggers add duplicates.
+    pending_ids = {r.get("id") for r in read_pending(pending_path) if r.get("id")}
+    already_known_ids = existing_ids | pending_ids
+    novel = [c for c in candidates if not is_duplicate(c, already_known_ids)]
 
     # ------------------------------------------------------------------
     # Stage: append novel candidates to the pending file

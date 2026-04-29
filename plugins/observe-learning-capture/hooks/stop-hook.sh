@@ -122,16 +122,20 @@ fi
 # additional signals for boundary/error discoveries.
 # ---------------------------------------------------------------------------
 DISCOVERY_HIT=0
-for phrase in "turns out" "actually" "discovered" "it errors" "must be" \
-              "won't accept" "cascade" "surprisingly" "rejected" \
-              "deadlock" "doesn't cascade" "managed by" "non-blocking"; do
+for phrase in "turns out" "discovered" "it errors" "won't accept" \
+              "surprisingly" "rejected" "deadlock" "doesn't cascade"; do
     if [[ "$TURN_TEXT" == *"$phrase"* ]]; then
         DISCOVERY_HIT=1
         break
     fi
 done
 
+shopt -u nocasematch  # Must precede regex block: [A-Z] requires uppercase under normal matching
+
 # Additional regex-based discovery signals (only checked if phrase scan missed):
+# WHY after shopt -u: [A-Z] would match lowercase under nocasematch, so
+# delete[A-Z][a-zA-Z]*\( would spuriously match 'deletedataset(' — moving
+# shopt -u here ensures CamelCase mutations like deleteDataset( are required.
 if (( DISCOVERY_HIT == 0 )); then
     # HTTP 4xx/5xx error code mention — e.g. "HTTP 403" or "HTTP 500"
     if [[ "$TURN_TEXT" =~ HTTP[[:space:]]*[45][0-9][0-9] ]]; then
@@ -141,8 +145,6 @@ if (( DISCOVERY_HIT == 0 )); then
         DISCOVERY_HIT=1
     fi
 fi
-
-shopt -u nocasematch
 
 if (( DISCOVERY_HIT == 0 )); then
     [[ "${PREFILTER_ONLY:-0}" == "1" ]] && exit 1
