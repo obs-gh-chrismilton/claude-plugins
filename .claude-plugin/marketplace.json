@@ -16,6 +16,11 @@
       "name": "snowflake-brand",
       "source": "./plugins/snowflake-brand",
       "description": "Snowflake brand guidelines for designs, code, presentations, and marketing materials"
+    },
+    {
+      "name": "observe-learning-capture",
+      "source": "./plugins/observe-learning-capture",
+      "description": "Auto-captures Observe-platform learnings from session transcripts; stages for review; promotes approved candidates into ObserveIE.md for cross-customer propagation"
     }
   ]
 }
