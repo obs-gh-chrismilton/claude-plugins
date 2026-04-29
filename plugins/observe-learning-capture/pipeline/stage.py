@@ -380,13 +380,41 @@ def _parse_yaml_block(lines: list[str], base_indent: int) -> tuple[Any, int]:
                 i += 1
             result[key] = "\n".join(block_lines).rstrip()
         else:
-            # Inline value — handle empty-container markers before scalar parse.
-            # C2: `[]` and `{}` written by _render_yaml must come back as the
-            # correct empty Python container, not the string "[]" or "{}".
+            # Inline value — handle empty/inline-list/dict markers before scalar
+            # parse. C2: `[]` and `{}` written by _render_yaml must come back as
+            # the correct empty Python container, not the string "[]" or "{}".
+            # Q2 fix: Haiku follows the prompt's example which uses inline list
+            # syntax — `tags: [opal, syntax]`. Previously this fell through to
+            # _parse_scalar which returned the literal string "[opal, syntax]",
+            # and then list(tags) would decompose it into characters. We now
+            # detect the `[...]` pattern and parse it properly here.
             if val == "[]":
                 result[key] = []
             elif val == "{}":
                 result[key] = {}
+            elif val.startswith("[") and val.endswith("]"):
+                # Inline list: [a, b, c] or ["x", "y"] — common in Haiku output.
+                # Strip the outer brackets, split on comma, then trim whitespace
+                # and any surrounding quote characters from each item.
+                inner = val[1:-1].strip()
+                if not inner:
+                    # "[   ]" → empty list (belt-and-suspenders; `[]` caught above)
+                    result[key] = []
+                else:
+                    items = [item.strip() for item in inner.split(",")]
+                    # Strip surrounding quotes (single or double) if present.
+                    # WHY: Haiku may emit `["opal", "syntax"]` or `[opal, syntax]`;
+                    # both should produce the same Python list of bare strings.
+                    stripped_items = []
+                    for item in items:
+                        if len(item) >= 2 and (
+                            (item.startswith('"') and item.endswith('"'))
+                            or (item.startswith("'") and item.endswith("'"))
+                        ):
+                            stripped_items.append(item[1:-1])
+                        else:
+                            stripped_items.append(item)
+                    result[key] = stripped_items
             else:
                 result[key] = _parse_scalar(val)
             i += 1

@@ -132,6 +132,20 @@ class TestStageEdgeCases(unittest.TestCase):
         self.assertIsNone(records[0]["key2"])
         self.assertEqual(records[0]["key3"], "value3")
 
+    def test_inline_list_parses_correctly(self):
+        """Q2 fix: stage._parse_yaml_block handles inline [a, b] lists."""
+        from pipeline.stage import _parse_yaml_list
+        content = """---
+key: value
+items: [a, b, c]
+quoted: ["x", "y"]
+empty: []
+"""
+        records = _parse_yaml_list(content)
+        self.assertEqual(records[0]["items"], ["a", "b", "c"])
+        self.assertEqual(records[0]["quoted"], ["x", "y"])
+        self.assertEqual(records[0]["empty"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

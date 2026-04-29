@@ -1821,7 +1821,7 @@ class Classifier:
                 captured_at=captured_at,
             )
             haiku_output = _invoke_haiku(prompt, self.model)
-        except (RuntimeError, OSError) as e:
+        except (RuntimeError, OSError, subprocess.SubprocessError) as e:
             return [
                 build_marker_candidate(
                     failure_reason=str(e),

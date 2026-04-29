@@ -4,6 +4,7 @@ We mock the subprocess call to `claude` CLI. Real Haiku calls are only
 exercised via end-to-end tests (Task 16).
 """
 import json
+import subprocess
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -92,6 +93,86 @@ class TestMarkerCandidate(unittest.TestCase):
         )
         self.assertIn("self-error", c.tags)
         self.assertIn("haiku timeout", c.fact)
+
+
+class TestClassifierEdgeCases(unittest.TestCase):
+    @mock.patch("pipeline.classifier._invoke_haiku")
+    def test_subprocess_timeout_emits_marker(self, mock_invoke):
+        """Q1: subprocess.TimeoutExpired must be caught and produce a marker."""
+        mock_invoke.side_effect = subprocess.TimeoutExpired(cmd="claude", timeout=60)
+        with tempfile.TemporaryDirectory() as d:
+            obs = Path(d) / "ObserveIE.md"
+            obs.write_text("", encoding="utf-8")
+            c = Classifier(
+                model="m",
+                prompt_template_path=_prompts_dir() / "classifier.md",
+                observeie_md_path=obs,
+            )
+            cands = c.classify(turn_text="x", session_id="s", cwd="/c")
+            self.assertEqual(len(cands), 1)
+            self.assertIn("self-error", cands[0].tags)
+
+    def test_inline_tags_parsed_as_list(self):
+        """Q2: tags: [opal, syntax] must parse as ['opal', 'syntax'], not chars."""
+        sample = """\
+- title: "Test"
+  fact: |
+    Test fact.
+  proposed_section: "X"
+  confidence: high
+  tags: [opal, syntax]
+  classifier_confidence_score: 0.5
+"""
+        cands = parse_haiku_yaml_output(sample)
+        self.assertEqual(len(cands), 1)
+        self.assertEqual(cands[0]["tags"], ["opal", "syntax"])
+
+    def test_inline_quoted_tags(self):
+        """Inline tags with quotes parse correctly."""
+        sample = """\
+- title: "T"
+  fact: f
+  proposed_section: X
+  confidence: high
+  tags: ["opal", "syntax"]
+"""
+        cands = parse_haiku_yaml_output(sample)
+        self.assertEqual(cands[0]["tags"], ["opal", "syntax"])
+
+    def test_null_output_returns_empty(self):
+        """Q8: 'null' from Haiku → empty list, not malformed marker."""
+        self.assertEqual(parse_haiku_yaml_output("null"), [])
+        self.assertEqual(parse_haiku_yaml_output("~"), [])
+
+    def test_fence_stripping(self):
+        """Haiku may wrap in ```yaml ... ``` — fences must be stripped."""
+        fenced = """```yaml
+- title: T
+  fact: f
+  proposed_section: X
+  confidence: high
+  tags: [opal]
+```"""
+        cands = parse_haiku_yaml_output(fenced)
+        self.assertEqual(len(cands), 1)
+        self.assertEqual(cands[0]["title"], "T")
+
+    @mock.patch("pipeline.classifier._invoke_haiku")
+    def test_happy_path_tags_round_trip(self, mock_invoke):
+        """Q2 regression: full classify() with inline tags produces correct tag list."""
+        mock_invoke.return_value = SAMPLE_YAML_OUTPUT
+        with tempfile.TemporaryDirectory() as d:
+            obs = Path(d) / "ObserveIE.md"
+            obs.write_text("", encoding="utf-8")
+            c = Classifier(
+                model="m",
+                prompt_template_path=_prompts_dir() / "classifier.md",
+                observeie_md_path=obs,
+            )
+            cands = c.classify(turn_text="x", session_id="s", cwd="/c")
+            self.assertEqual(len(cands), 1)
+            # Tags must be a real list of strings, NOT a character-decomposed list
+            self.assertEqual(cands[0].tags, ["opal", "syntax"])
 
 
 def _prompts_dir() -> Path:

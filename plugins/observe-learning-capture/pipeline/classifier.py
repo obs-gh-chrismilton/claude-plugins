@@ -73,8 +73,12 @@ class Classifier:
                 captured_at=captured_at,
             )
             haiku_output = _invoke_haiku(prompt, self.model)
-        except (RuntimeError, OSError) as e:
-            # Log full context so the operator can diagnose without file access.
+        except (RuntimeError, OSError, subprocess.SubprocessError) as e:
+            # Q1 fix: subprocess.TimeoutExpired inherits from subprocess.SubprocessError,
+            # NOT from RuntimeError or OSError. Without this third clause a 60-second
+            # Haiku hang would escape the handler and crash the SessionStop hook.
+            # Catching subprocess.SubprocessError covers TimeoutExpired,
+            # CalledProcessError, and any future subprocess exceptions cleanly.
             # WHY: spec §9 — log AND surface. Never silent.
             print(
                 f"[observe-learning-capture] classifier.py: haiku invocation "
@@ -142,7 +146,11 @@ def parse_haiku_yaml_output(output: str) -> List[dict[str, Any]]:
         List of dicts, one per candidate. Empty list on empty/malformed input.
     """
     output = output.strip()
-    if not output or output == "[]":
+    # Q8 fix: Haiku may respond with "null" or "~" to indicate no learnings found.
+    # Treat these as "no candidates" rather than letting them fall through to the
+    # YAML parser which would return an empty list with a spurious malformed-yaml
+    # warning in the classifier (because "null" parses to None, not a list).
+    if not output or output in ("[]", "null", "~"):
         return []
     # Strip markdown fences if Haiku wraps in ```yaml ... ```
     # WHY: the classifier prompt tells Haiku it MAY wrap; we normalize both forms.
