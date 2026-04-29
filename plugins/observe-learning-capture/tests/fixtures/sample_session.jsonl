@@ -1,0 +1,4 @@
+{"type":"user","message":{"role":"user","content":"Delete the orphan datastreams."},"uuid":"u1","timestamp":"2026-04-29T11:30:00Z"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"I'll delete them."}]},"uuid":"a1","timestamp":"2026-04-29T11:30:05Z"}
+{"type":"user","message":{"role":"user","content":"What happened?"},"uuid":"u2","timestamp":"2026-04-29T11:31:00Z"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Cascade-ordering deadlock on Tracing/Span — managed datasets reference each other. No force flag exists."}]},"uuid":"a2","timestamp":"2026-04-29T11:31:30Z"}
