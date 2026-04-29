@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, List, Optional
 
@@ -97,6 +97,19 @@ class ClassifierMeta:
     prompt_version: str
     confidence_score: Optional[float] = None
 
+    def __post_init__(self) -> None:
+        """Validate confidence_score is within [0.0, 1.0] when provided.
+
+        Raises:
+            ValueError: If confidence_score is outside the valid range.
+        """
+        # Guard against out-of-range floats that would slip through
+        # the type system — the model may return scores like 1.05.
+        if self.confidence_score is not None and not (0.0 <= self.confidence_score <= 1.0):
+            raise ValueError(
+                f"confidence_score must be in [0.0, 1.0], got {self.confidence_score}"
+            )
+
     def to_dict(self) -> dict[str, Any]:
         """Serialize to the YAML classifier sub-object per spec §7.1.
 
@@ -114,6 +127,25 @@ class ClassifierMeta:
         if self.confidence_score is not None:
             d["confidence_score"] = self.confidence_score
         return d
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "ClassifierMeta":
+        """Deserialize from a YAML classifier sub-object.
+
+        Symmetric counterpart to to_dict(). confidence_score is optional
+        in the dict — matches to_dict()'s omit-when-None behavior.
+
+        Args:
+            d: Dict as produced by to_dict() or loaded from YAML.
+
+        Returns:
+            ClassifierMeta instance with __post_init__ validation applied.
+        """
+        return cls(
+            model=d["model"],
+            prompt_version=d["prompt_version"],
+            confidence_score=d.get("confidence_score"),
+        )
 
 
 @dataclass
@@ -147,6 +179,23 @@ class Candidate:
     classifier: Optional[ClassifierMeta] = None
     dupe_warning: Optional[str] = None
     last_seen_at: Optional[datetime] = None
+
+    def __post_init__(self) -> None:
+        """Validate confidence on every construction path.
+
+        This guard runs whether the Candidate was built via create() or
+        directly via cls(...) (e.g. from_yaml_record). Defense-in-depth:
+        create() still pre-validates, but __post_init__ is the structural
+        contract that can't be bypassed.
+
+        Raises:
+            ValueError: If confidence is not in the allowed set.
+        """
+        if self.confidence not in _VALID_CONFIDENCE:
+            raise ValueError(
+                f"confidence must be one of {sorted(_VALID_CONFIDENCE)}, "
+                f"got {self.confidence!r}"
+            )
 
     @classmethod
     def create(
@@ -194,17 +243,21 @@ class Candidate:
             fact=fact,
             proposed_section=proposed_section,
             confidence=confidence,
-            tags=tags,
+            tags=list(tags),  # defensive copy — see I1 in T02 review
             provenance=provenance,
             classifier=classifier,
         )
 
     def to_yaml_record(self) -> dict[str, Any]:
-        """Serialize to the YAML record shape defined in spec §7.1.
+        """Serialize to the YAML record shape in spec §7.1.
 
-        The 'source' key maps to provenance.to_dict(); 'classifier' is
-        omitted when not set. Optional fields (dupe_warning, last_seen_at)
-        are included only when populated to keep YAML minimal.
+        The `classifier` block is omitted when None — this happens for
+        programmatically-injected candidates that bypass the Haiku
+        classifier (e.g., marker candidates from error handling in §9).
+        Records without a `classifier` block are still valid per §7.1.
+
+        Optional fields (dupe_warning, last_seen_at) are included only
+        when populated to keep YAML minimal.
 
         Returns:
             Dict with all required §7.1 fields. Ready for yaml.dump().
@@ -228,6 +281,51 @@ class Candidate:
         if self.last_seen_at is not None:
             record["last_seen_at"] = self.last_seen_at.isoformat()
         return record
+
+    @classmethod
+    def from_yaml_record(cls, d: dict[str, Any]) -> "Candidate":
+        """Reconstruct a Candidate from a YAML record (e.g., from the
+        staging file). Bypasses `create()` because id is already known
+        and confidence was validated at write time. __post_init__
+        (added in C2) still validates structurally.
+
+        Args:
+            d: Dict as produced by to_yaml_record() or loaded from YAML.
+
+        Returns:
+            Candidate with all fields restored, including optional ones.
+
+        Raises:
+            ValueError: If the record carries an invalid confidence value.
+        """
+        # Reconstruct nested objects from their sub-dicts.
+        provenance = Provenance.from_dict(d["source"])
+
+        # classifier block is optional per spec §7.1 — absent for marker candidates.
+        classifier: Optional[ClassifierMeta] = None
+        if "classifier" in d:
+            classifier = ClassifierMeta.from_dict(d["classifier"])
+
+        # last_seen_at may be absent on first staging or omitted when None.
+        last_seen_at: Optional[datetime] = None
+        if d.get("last_seen_at") is not None:
+            last_seen_at = datetime.fromisoformat(d["last_seen_at"])
+
+        # Call cls(...) directly — id is already in the record and was
+        # derived deterministically at write time; recomputing it would
+        # fail if the fact text was ever normalized differently.
+        return cls(
+            id=d["id"],
+            title=d["title"],
+            fact=d["fact"],
+            proposed_section=d["proposed_section"],
+            confidence=d["confidence"],
+            tags=list(d.get("tags", [])),  # defensive copy on read too
+            provenance=provenance,
+            classifier=classifier,
+            dupe_warning=d.get("dupe_warning"),
+            last_seen_at=last_seen_at,
+        )
 
 
 def _hash_fact(fact: str) -> str:
