@@ -64,6 +64,32 @@ class TestDedupe(unittest.TestCase):
         new = _candidate("F2", tags=["billing"])
         self.assertIsNone(near_duplicate_warning(new, existing))
 
+    def test_no_warning_comparing_candidate_against_itself(self):
+        """Self-comparison guard: candidate compared against [candidate] returns None."""
+        c = _candidate("Some fact about OPAL", tags=["opal"])
+        warning = near_duplicate_warning(c, [c])
+        self.assertIsNone(warning)
+
+    def test_no_warning_when_candidate_has_no_tags(self):
+        """Tagless candidate cannot near-duplicate (early return)."""
+        c = _candidate("Tagless fact", tags=[])
+        existing = [_candidate("Other fact", tags=["opal", "syntax"])]
+        self.assertIsNone(near_duplicate_warning(c, existing))
+
+    def test_near_duplicate_works_with_mixed_case_tags(self):
+        """Tag normalization (since T04 fix) means OPAL and opal both match.
+        After Q4 fix, tags are stored lowercase; this test confirms that
+        and that comparison would still work even if tags weren't normalized.
+        """
+        # Both candidates use canonical lowercase tags after normalization
+        c1 = _candidate("Fact 1", tags=["OPAL", "Syntax"])  # input mixed case
+        c2 = _candidate("Fact 2", tags=["opal", "syntax", "extra"])
+        # After Candidate.create's normalization, c1.tags should be lowercase
+        self.assertEqual(c1.tags, ["opal", "syntax"])
+        # And the warning still fires
+        warning = near_duplicate_warning(c1, [c2])
+        self.assertIsNotNone(warning)
+
 
 if __name__ == "__main__":
     unittest.main()

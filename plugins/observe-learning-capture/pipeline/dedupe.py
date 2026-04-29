@@ -17,6 +17,7 @@ Why content-hash instead of fuzzy text match?
 from __future__ import annotations
 
 import re
+import sys
 from pathlib import Path
 from typing import Iterable, Optional, Set
 
@@ -28,6 +29,12 @@ from pipeline.types import Candidate
 # Format: <!-- id:XXXXXXXX captured:YYYY-MM-DD -->
 # The id group captures exactly 8 lowercase hex characters per spec §7.2.
 # We're deliberately lenient with whitespace around the fields.
+#
+# Matches the HTML comment merge.py emits during merge. Note: the regex
+# requires at least one whitespace character between `id:XXXXXXXX` and
+# `captured:...` — merge.py always emits a single space, so this is fine
+# in normal operation. Hand-edited markdown without the space won't match.
+# See merge.py and spec §7.2.
 # ---------------------------------------------------------------------------
 _ID_COMMENT_RE = re.compile(
     r"<!--\s*id:([0-9a-f]{8})\s+captured:[^\s>]+\s*-->"
@@ -39,25 +46,30 @@ def extract_existing_ids(observeie_md_path: Path) -> Set[str]:
     merged into it, extracted from the HTML id comments.
 
     The dedup pipeline calls this once per session and caches the result.
-    Returns an empty set (not an error) when the file is missing — the
-    classifier still runs; we just have no prior knowledge to dedup against.
+
+    Returns empty set if file missing (silent — expected on first run).
+    Returns empty set + stderr log on OSError (permissions / FS errors).
 
     Args:
         observeie_md_path: Absolute or relative Path to ObserveIE.md.
 
     Returns:
         Set of 8-char hex id strings found in the file's id comments.
-        Empty set if the file does not exist or cannot be read.
+        Empty set (silent) if the file does not exist.
+        Empty set (with stderr log) on read error.
     """
     if not observeie_md_path.exists():
-        # Graceful degradation per spec §5.3: missing file is not an error.
-        # Log-worthy for debugging, but not worth raising here.
+        # Intentionally silent: first-run / no-ObserveIE-yet is the normal case.
+        # OSError below (read-error on existing file) is logged because it
+        # indicates a real problem (permissions, FS error, broken symlink).
         return set()
     try:
         content = observeie_md_path.read_text(encoding="utf-8")
-    except OSError:
-        # Permission denied, symlink loop, etc. — still a soft failure;
-        # return empty rather than crashing the whole pipeline run.
+    except OSError as exc:
+        print(
+            f"[observe-learning-capture] dedupe.py: cannot read {observeie_md_path}: {exc}",
+            file=sys.stderr,
+        )
         return set()
     # findall returns the captured group (the id) for each match.
     return set(_ID_COMMENT_RE.findall(content))
@@ -71,6 +83,9 @@ def is_duplicate(candidate: Candidate, existing_ids: Set[str]) -> bool:
     The check is intentionally exact: same normalized fact → same id →
     duplicate. This rejects re-submission of the identical learning without
     blocking near-variants (those are surfaced by near_duplicate_warning).
+    In the vanishingly unlikely event of a hash collision (>65K entries
+    lifetime per design §5.3), the second candidate will be treated as
+    a duplicate. User can force-capture via /observe-capture to bypass.
 
     Args:
         candidate: The newly-captured Candidate to check.
@@ -93,7 +108,10 @@ def near_duplicate_warning(
     is strictly greater than 50% of the smaller tag set. This catches
     topical duplicates (same concept, slightly different wording) without
     triggering on broad shared tags like "opal" appearing across dozens
-    of unrelated facts.
+    of unrelated facts. At the extreme, a 1-tag candidate matching another
+    1-tag candidate with the same tag will always warn (1/1 = 100% > 50%).
+    This is intentional — two facts both tagged with only "opal" are almost
+    certainly topically related.
 
     The warning is stored in Candidate.dupe_warning and surfaced during
     human review — it is a hint, not a block. The reviewer can dismiss or
@@ -112,6 +130,8 @@ def near_duplicate_warning(
     if not candidate.tags:
         return None
 
+    # Defensive lowercase — Candidate.create normalizes at storage (since T04 fix),
+    # but this guard handles direct construction paths and future callers.
     new_tag_set = {t.lower() for t in candidate.tags}
 
     for other in other_candidates:

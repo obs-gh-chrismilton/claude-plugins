@@ -243,7 +243,7 @@ class Candidate:
             fact=fact,
             proposed_section=proposed_section,
             confidence=confidence,
-            tags=list(tags),  # defensive copy — see I1 in T02 review
+            tags=[t.lower() for t in tags],  # normalize + defensive copy — canonical lowercase
             provenance=provenance,
             classifier=classifier,
         )
@@ -320,7 +320,7 @@ class Candidate:
             fact=d["fact"],
             proposed_section=d["proposed_section"],
             confidence=d["confidence"],
-            tags=list(d.get("tags", [])),  # defensive copy on read too
+            tags=[t.lower() for t in d.get("tags", [])],  # normalize + defensive copy — canonical lowercase
             provenance=provenance,
             classifier=classifier,
             dupe_warning=d.get("dupe_warning"),

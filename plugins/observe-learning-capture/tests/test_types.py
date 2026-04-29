@@ -159,6 +159,33 @@ class TestCandidate(unittest.TestCase):
         original_tags.append("INJECTED")
         self.assertNotIn("INJECTED", c.tags)
 
+    # ---- Q4: tag normalization at construction ----
+    def test_tags_normalized_to_lowercase_at_creation(self):
+        """Q4 fix: tags are stored canonical lowercase regardless of input case."""
+        c = Candidate.create(
+            title="t", fact="f", proposed_section="X",
+            confidence="high", tags=["OPAL", "Syntax-Quirks"],
+            provenance=_dummy_provenance(),
+        )
+        self.assertEqual(c.tags, ["opal", "syntax-quirks"])
+
+    def test_from_yaml_record_normalizes_tags(self):
+        """Defensive: even if YAML on disk had mixed case, deserializer normalizes."""
+        record = {
+            "id": "abc12345",
+            "title": "t", "fact": "f",
+            "proposed_section": "X",
+            "confidence": "high",
+            "tags": ["OPAL", "OPAL"],  # mixed case + dup
+            "source": {
+                "session_id": "s", "cwd": "/tmp",
+                "captured_at": "2026-04-29T11:33:00+00:00",
+                "excerpt": "e",
+            },
+        }
+        c = Candidate.from_yaml_record(record)
+        self.assertEqual(c.tags, ["opal", "opal"])
+
 
 class TestClassifierMeta(unittest.TestCase):
     # ---- I2: ClassifierMeta.from_dict ----
