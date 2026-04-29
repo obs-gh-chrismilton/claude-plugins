@@ -70,5 +70,7 @@ Working directory: {{CWD}}
 
 ---
 
-Now extract candidates. Return YAML only — no prose explanation, no markdown
-fences. Empty list `[]` if no candidates.
+Now extract candidates. Return YAML only — no prose explanation. You may
+wrap the YAML in a ```yaml ... ``` markdown fence (matching the example
+format above; the parser strips fences). Empty list `[]` on its own line
+if no candidates.
