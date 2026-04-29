@@ -9,6 +9,7 @@ The transcript path is provided to hooks via $CLAUDE_TRANSCRIPT_PATH.
 from __future__ import annotations
 
 import json
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Optional, Tuple
@@ -26,9 +27,15 @@ class Turn:
 
 def _iter_jsonl(path: Path) -> Iterator[dict]:
     """Yield parsed JSON objects from a JSONL file. Skips malformed lines
-    (logged to stderr but not fatal — partial captures are still useful).
+    and reports them to stderr; returns nothing on missing-file (silent)
+    or read-error (logged to stderr).
+
+    Per design §9: malformed-line and read-error cases are logged with
+    full context but never raise — partial captures are still useful.
     """
     if not path.exists():
+        # Silent return on missing file — expected at SessionStart before
+        # Claude Code creates the transcript.
         return
     try:
         with path.open("r", encoding="utf-8") as f:
@@ -38,10 +45,22 @@ def _iter_jsonl(path: Path) -> Iterator[dict]:
                     continue
                 try:
                     yield json.loads(line)
-                except json.JSONDecodeError:
-                    # Skip malformed line; don't blow up the whole hook
+                except json.JSONDecodeError as exc:
+                    # Log the bad line with full context so it can be debugged,
+                    # but don't abort — we still want whatever is parseable.
+                    print(
+                        f"[observe-learning-capture] transcript.py: skipping malformed JSON "
+                        f"in {path}: {exc}",
+                        file=sys.stderr,
+                    )
                     continue
-    except OSError:
+    except OSError as exc:
+        # Log the I/O error (permissions, etc.) and abort the generator.
+        # Caller receives an empty iterator; the hook degrades gracefully.
+        print(
+            f"[observe-learning-capture] transcript.py: cannot read {path}: {exc}",
+            file=sys.stderr,
+        )
         return
 
 
@@ -109,7 +128,11 @@ def last_turn_pair(path: Path) -> Tuple[Optional[Turn], Optional[Turn]]:
 
 
 def all_assistant_turns(path: Path) -> Iterator[Turn]:
-    """Yield every assistant turn in order. Used for SessionEnd full-scan."""
+    """Yields every assistant turn in transcript order. Used for SessionEnd full-scan.
+
+    Note: returns a generator — iterating it a second time yields nothing.
+    Callers needing multiple passes: `turns = list(all_assistant_turns(path))`.
+    """
     for record in _iter_jsonl(path):
         turn = _record_to_turn(record)
         if turn is not None and turn.role == "assistant":
