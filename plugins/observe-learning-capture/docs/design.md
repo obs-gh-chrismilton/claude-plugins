@@ -222,7 +222,7 @@ Triggered by user-side approval action (handled by my conversational layer, see 
 
 Per-candidate merge:
 1. Read ObserveIE.md.
-2. Find heading matching `proposed_section` (case-insensitive, `##` and `###` both considered).
+2. Find heading matching `proposed_section` as a `##` heading (case-insensitive). v1 routes only to top-level sections; `###` subsections are out of scope.
 3. If heading exists → append `- {fact}` as a bullet under it (with HTML comment carrying `id` for future re-dedup).
 4. If heading doesn't exist → append a new `## {proposed_section}` section at end of file with the bullet.
 5. Remove candidate from `.observeie-pending.md`.

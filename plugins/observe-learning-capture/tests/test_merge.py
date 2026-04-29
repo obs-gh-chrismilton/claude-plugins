@@ -68,6 +68,60 @@ class TestMerge(unittest.TestCase):
             self.assertEqual(len(remaining), 1)
             self.assertEqual(remaining[0]["fact"], "fact two")
 
+    def test_merge_bullet_parses_through_dedupe(self):
+        """Format-contract test: merge writes a bullet that dedupe.py reads back."""
+        from pipeline.dedupe import extract_existing_ids
+        with tempfile.TemporaryDirectory() as d:
+            obs = Path(d) / "ObserveIE.md"
+            c = _candidate("Some platform fact")
+            merge_candidate(c, obs)
+            ids = extract_existing_ids(obs)
+            self.assertIn(c.id, ids,
+                "Bullet written by merge.py must be parseable by dedupe.py's regex")
+
+    def test_merge_sanitizes_html_comments_in_fact(self):
+        """C1: fact containing <!-- id:fake1234 captured:2026-01-01 --> must NOT
+        be parseable by dedupe.py as containing 'fake1234'.
+        """
+        from pipeline.dedupe import extract_existing_ids
+        with tempfile.TemporaryDirectory() as d:
+            obs = Path(d) / "ObserveIE.md"
+            c = _candidate(
+                "The plugin emits <!-- id:fake1234 captured:2026-01-01 --> as id annotation"
+            )
+            merge_candidate(c, obs)
+            ids = extract_existing_ids(obs)
+            self.assertIn(c.id, ids)
+            self.assertNotIn("fake1234", ids,
+                "Embedded HTML comment in fact must not be extracted as a real id")
+
+    def test_merge_strips_leading_bullet_marker_from_fact(self):
+        """I1: fact starting with '- ' must not produce '- - text' bullet."""
+        with tempfile.TemporaryDirectory() as d:
+            obs = Path(d) / "ObserveIE.md"
+            c = _candidate("- already-a-bullet text")
+            merge_candidate(c, obs)
+            content = obs.read_text(encoding="utf-8")
+            self.assertNotIn("- - already-a-bullet", content)
+            self.assertIn("- already-a-bullet", content)
+
+    def test_merge_writes_audit_log(self):
+        """C2: spec §5.5 step 6 — audit log entry written."""
+        import os
+        with tempfile.TemporaryDirectory() as d:
+            obs = Path(d) / "ObserveIE.md"
+            c = _candidate("Audit test fact")
+            # merge_candidate writes to the real ~/.claude/logs/ path.
+            # This is acceptable: the log is append-only and never read by
+            # the test suite as a control path. We only verify it was written.
+            merge_candidate(c, obs)
+            real_log = Path(os.path.expanduser("~/.claude/logs/observe-learning-capture.log"))
+            self.assertTrue(real_log.exists(),
+                "Audit log file should exist after merge")
+            content = real_log.read_text(encoding="utf-8")
+            self.assertIn(f"id={c.id}", content)
+            self.assertIn("action=MERGE", content)
+
 
 if __name__ == "__main__":
     unittest.main()

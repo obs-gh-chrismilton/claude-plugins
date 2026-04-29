@@ -15,15 +15,14 @@ Changing this format without updating dedupe.py will break deduplication.
 """
 from __future__ import annotations
 
+import os
 import re
+import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 from pipeline.stage import read_pending
 from pipeline.types import Candidate
-
-
-# Matches any `#` heading at level 1-6 (used to detect next-section boundaries)
-_SECTION_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$", re.MULTILINE)
 
 
 def merge_candidate(candidate: Candidate, observeie_md: Path) -> None:
@@ -47,9 +46,29 @@ def merge_candidate(candidate: Candidate, observeie_md: Path) -> None:
     # directory may not yet exist (e.g. ~/.claude/ on a fresh install).
     observeie_md.parent.mkdir(parents=True, exist_ok=True)
 
+    # C1 fix: sanitize HTML comment markers in fact text.
+    # A fact that describes the plugin's own annotation format (e.g.
+    # "the plugin emits <!-- id:abcd1234 ... -->") would otherwise inject a
+    # spurious <!-- id:... --> token that dedupe.py's regex extracts as a
+    # real id. Future candidates with that id would be spuriously deduped.
+    # Zero-width space (U+200B) breaks the <!-- and --> token recognition
+    # in dedupe.py's regex without changing how the text looks to a human
+    # reader in rendered markdown.
+    safe_fact = (
+        candidate.fact.strip()
+        .replace("<!--", "<​!--")   # zero-width space after < breaks <!--
+        .replace("-->", "--​>")     # zero-width space before > breaks -->
+    )
+
+    # I1 fix: strip leading markdown list markers from the fact string.
+    # If a candidate's fact starts with "- ", "* ", or "+ ", the rendered
+    # bullet would be "- - text" (a double-bullet). Strip the leading marker
+    # so the output is a clean single bullet.
+    safe_fact = re.sub(r"^[-*+]\s+", "", safe_fact)
+
     # Bullet format per spec §7.2 — must stay in sync with dedupe.py regex.
     bullet = (
-        f"- {candidate.fact.strip()} "
+        f"- {safe_fact} "
         f"<!-- id:{candidate.id} "
         f"captured:{candidate.provenance.captured_at.date().isoformat()} -->"
     )
@@ -60,6 +79,8 @@ def merge_candidate(candidate: Candidate, observeie_md: Path) -> None:
             f"# ObserveIE\n\n## {candidate.proposed_section}\n\n{bullet}\n"
         )
         observeie_md.write_text(new_content, encoding="utf-8")
+        # C2 fix: spec §5.5 step 6 — log BEFORE return so every code path logs.
+        _log_merge(candidate, observeie_md)
         return
 
     content = observeie_md.read_text(encoding="utf-8")
@@ -97,6 +118,47 @@ def merge_candidate(candidate: Candidate, observeie_md: Path) -> None:
 
     observeie_md.write_text(content, encoding="utf-8")
 
+    # C2 fix: spec §5.5 step 6 — write audit log entry after every successful merge.
+    _log_merge(candidate, observeie_md)
+
+
+def _log_merge(candidate: Candidate, observeie_md: Path) -> None:
+    """Append a structured MERGE record to the audit log.
+
+    Log path: ~/.claude/logs/observe-learning-capture.log
+
+    Tolerant of log-write failures — logs to stderr and continues rather
+    than raising, because an audit-log failure must not block a successful
+    merge. This is the only deliberate exception to the "belt-and-suspenders,
+    never silent" rule: we log the failure to stderr so it is visible to the
+    user, but we do not propagate it to the caller (merge already succeeded).
+
+    Args:
+        candidate: The Candidate that was just merged.
+        observeie_md: Path to the ObserveIE.md that received the merge.
+    """
+    log_path = Path(os.path.expanduser("~/.claude/logs/observe-learning-capture.log"))
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        line = (
+            f"{timestamp} [INFO] component=merge "
+            f"action=MERGE id={candidate.id} "
+            f"section={candidate.proposed_section!r} "
+            f"session={candidate.provenance.session_id} "
+            f"target={observeie_md}\n"
+        )
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write(line)
+    except OSError as exc:
+        # Log failure to stderr but do not raise — merge already succeeded.
+        # WHY: a broken log path (permissions, full disk) must not undo the
+        # merge that has already been written to ObserveIE.md.
+        print(
+            f"[observe-learning-capture] merge.py: failed to write audit log: {exc}",
+            file=sys.stderr,
+        )
+
 
 def remove_from_pending(candidate_id: str, pending_file: Path) -> None:
     """Remove the candidate with matching id from the pending staging file.
@@ -116,7 +178,9 @@ def remove_from_pending(candidate_id: str, pending_file: Path) -> None:
         pending_file: Path to the `.pending.md` staging file.
 
     Raises:
-        OSError: If the file cannot be written after rewrite. Not swallowed.
+        OSError: If the file cannot be written after rewrite. Logged to stderr
+                 with full context before re-raising so the caller sees both
+                 the exception and the human-readable message.
     """
     if not pending_file.exists():
         # Nothing to do — file may have been cleaned up already.
@@ -132,19 +196,31 @@ def remove_from_pending(candidate_id: str, pending_file: Path) -> None:
     # Re-import here to avoid circular import (see docstring WHY above).
     from pipeline.stage import _render_yaml  # noqa: PLC0415
 
-    if not remaining:
-        # All candidates were removed — write an empty file rather than
-        # deleting it, so the path stays valid for future appends.
-        pending_file.write_text("", encoding="utf-8")
-        return
+    try:
+        if not remaining:
+            # All candidates were removed — write an empty file rather than
+            # deleting it, so the path stays valid for future appends.
+            pending_file.write_text("", encoding="utf-8")
+            return
 
-    # Reconstruct the YAML document stream from the surviving records.
-    # Each record gets a `---` boundary prefix, matching the append format
-    # in stage.py so that subsequent reads parse identically.
-    chunks = []
-    for record in remaining:
-        chunks.append("---\n" + _render_yaml(record, indent=0))
-    pending_file.write_text("\n".join(chunks) + "\n", encoding="utf-8")
+        # Reconstruct the YAML document stream from the surviving records.
+        # Each record gets a `---` boundary prefix, matching the append format
+        # in stage.py so that subsequent reads parse identically.
+        chunks = []
+        for record in remaining:
+            chunks.append("---\n" + _render_yaml(record, indent=0))
+        pending_file.write_text("\n".join(chunks) + "\n", encoding="utf-8")
+    except OSError as exc:
+        # I4 fix: log full context before re-raising so the caller can see
+        # what file failed and why. Silent-swallow would leave a ghost entry
+        # in the pending queue (the merged candidate would re-surface at next
+        # review), which is a correctness bug, not just a logging gap.
+        print(
+            f"[observe-learning-capture] merge.py: cannot write pending file "
+            f"{pending_file}: {exc}",
+            file=sys.stderr,
+        )
+        raise
 
 
 def _find_section_index(content: str, section_name: str) -> int | None:
