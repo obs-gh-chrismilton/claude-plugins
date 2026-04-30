@@ -21,6 +21,11 @@ Do NOT capture:
   CLAUDE.md, not here.
 - General programming concepts (these aren't Observe-specific).
 - Things already in "Already known" below.
+- **Facts that CONTRADICT items in "Already known"**. If the new turn claims
+  something opposite to an established fact (e.g., "actually X works now" when
+  Already known says "X does not work"), return `[]` — do not propose the
+  contradiction as a candidate. Established knowledge is the source of truth;
+  the human reviews changes deliberately, not via classifier-side overrides.
 - Speculation, plans, "we should try X next time" — only confirmed facts.
 - Trivia findable in tier-1 Observe public docs (e.g., "OPAL has a `filter`
   verb"). Bias toward gotchas, undocumented behavior, mutation signatures,
