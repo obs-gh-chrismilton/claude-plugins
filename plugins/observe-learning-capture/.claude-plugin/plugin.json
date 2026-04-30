@@ -1,0 +1,7 @@
+{
+  "name": "observe-learning-capture",
+  "description": "Auto-captures Observe-platform learnings from Claude Code sessions, stages them for review, promotes approved candidates into ObserveIE.md.",
+  "author": {
+    "name": "Chris Milton"
+  }
+}
