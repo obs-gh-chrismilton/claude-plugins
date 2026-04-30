@@ -5,8 +5,11 @@
 # transcript with Haiku (one big call). Catches anything the Stop-hook
 # prefilter false-negatived during the session.
 #
-# Env from Claude Code (same as stop-hook):
-#   $CLAUDE_TRANSCRIPT_PATH, $CLAUDE_SESSION_ID, $CLAUDE_PROJECT_DIR
+# Input contract from Claude Code:
+#   Claude Code passes hook input via stdin as JSON:
+#     { session_id, transcript_path, cwd, hook_event_name, ... }
+#   Env vars are NOT set by Claude Code — supported only as fallback for
+#   direct test/manual invocation.
 
 set -uo pipefail
 
@@ -19,21 +22,45 @@ log() {
     echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) [session-end-scan] $*" >> "$LOG_FILE"
 }
 
-TRANSCRIPT="${CLAUDE_TRANSCRIPT_PATH:-}"
+# ---------------------------------------------------------------------------
+# Read hook input — stdin JSON first, env-var fallback.
+#
+# Claude Code passes JSON to stdin: { session_id, transcript_path, cwd, ... }
+# Env vars are a fallback for direct invocation during testing.
+# ---------------------------------------------------------------------------
+HOOK_INPUT=""
+if [[ -t 0 ]]; then
+    # No piped stdin — fall back directly to env vars (test/manual invocation).
+    TRANSCRIPT="${CLAUDE_TRANSCRIPT_PATH:-}"
+    SESSION_ID="${CLAUDE_SESSION_ID:-unknown}"
+    PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$PWD}"
+else
+    HOOK_INPUT=$(cat)
+    if [[ -n "$HOOK_INPUT" ]]; then
+        TRANSCRIPT=$(printf '%s' "$HOOK_INPUT" | jq -r '.transcript_path // ""' 2>/dev/null)
+        SESSION_ID=$(printf '%s' "$HOOK_INPUT" | jq -r '.session_id // "unknown"' 2>/dev/null)
+        PROJECT_DIR=$(printf '%s' "$HOOK_INPUT" | jq -r '.cwd // ""' 2>/dev/null)
+    fi
+    # Final fallback to env vars if JSON parse failed or fields are empty.
+    TRANSCRIPT="${TRANSCRIPT:-${CLAUDE_TRANSCRIPT_PATH:-}}"
+    SESSION_ID="${SESSION_ID:-${CLAUDE_SESSION_ID:-unknown}}"
+    PROJECT_DIR="${PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-$PWD}}"
+fi
+
 if [[ -z "$TRANSCRIPT" || ! -f "$TRANSCRIPT" ]]; then
     log "no transcript — skip"
     exit 0
 fi
 
-log "running full-session scan (session=${CLAUDE_SESSION_ID:-unknown})"
+log "running full-session scan (session=$SESSION_ID)"
 
 # Synchronous (this is session end; user is leaving anyway).
 cd "$PLUGIN_ROOT"
 python3 -m pipeline.runner \
     --mode "session-end" \
     --transcript "$TRANSCRIPT" \
-    --session-id "${CLAUDE_SESSION_ID:-unknown}" \
-    --cwd "${CLAUDE_PROJECT_DIR:-$PWD}" \
+    --session-id "$SESSION_ID" \
+    --cwd "$PROJECT_DIR" \
     2>>"$LOG_FILE" || log "runner failed (non-fatal)"
 
 exit 0

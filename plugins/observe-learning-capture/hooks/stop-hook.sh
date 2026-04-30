@@ -7,10 +7,11 @@
 #
 # Always exits 0 (hooks must not block session flow). Errors are logged.
 #
-# Env from Claude Code:
-#   $CLAUDE_TRANSCRIPT_PATH  — path to session JSONL
-#   $CLAUDE_SESSION_ID       — session UUID
-#   $CLAUDE_PROJECT_DIR      — current project dir (cwd)
+# Input contract from Claude Code:
+#   Claude Code passes hook input via stdin as JSON:
+#     { session_id, transcript_path, cwd, hook_event_name, ... }
+#   Env vars ($CLAUDE_TRANSCRIPT_PATH etc.) are NOT set by Claude Code —
+#   they are supported here only as a fallback for direct test invocation.
 #
 # Debug env:
 #   PREFILTER_ONLY=1 — exit 0 if prefilter would pass, 1 otherwise.
@@ -29,11 +30,37 @@ log() {
 }
 
 # ---------------------------------------------------------------------------
-# Read transcript path from env
+# Read hook input — stdin JSON first, env-var fallback.
+#
+# Claude Code passes JSON to stdin: { session_id, transcript_path, cwd, ... }
+# Env vars are a fallback for direct invocation during testing.
+#
+# Detection: if stdin is a terminal (fd 0 is a tty), we're running interactively
+# or in an env-var-only test harness — skip stdin read and use env vars.
+# When Claude Code fires the hook, stdin is always a pipe (non-tty), so
+# the jq parse path is the one that runs in production.
 # ---------------------------------------------------------------------------
-TRANSCRIPT="${CLAUDE_TRANSCRIPT_PATH:-}"
+HOOK_INPUT=""
+if [[ -t 0 ]]; then
+    # No piped stdin — fall back directly to env vars (test/manual invocation).
+    TRANSCRIPT="${CLAUDE_TRANSCRIPT_PATH:-}"
+    SESSION_ID="${CLAUDE_SESSION_ID:-unknown}"
+    PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$PWD}"
+else
+    HOOK_INPUT=$(cat)
+    if [[ -n "$HOOK_INPUT" ]]; then
+        TRANSCRIPT=$(printf '%s' "$HOOK_INPUT" | jq -r '.transcript_path // ""' 2>/dev/null)
+        SESSION_ID=$(printf '%s' "$HOOK_INPUT" | jq -r '.session_id // "unknown"' 2>/dev/null)
+        PROJECT_DIR=$(printf '%s' "$HOOK_INPUT" | jq -r '.cwd // ""' 2>/dev/null)
+    fi
+    # Final fallback to env vars if JSON parse failed or fields are empty.
+    TRANSCRIPT="${TRANSCRIPT:-${CLAUDE_TRANSCRIPT_PATH:-}}"
+    SESSION_ID="${SESSION_ID:-${CLAUDE_SESSION_ID:-unknown}}"
+    PROJECT_DIR="${PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-$PWD}}"
+fi
+
 if [[ -z "$TRANSCRIPT" || ! -f "$TRANSCRIPT" ]]; then
-    log "no transcript at \$CLAUDE_TRANSCRIPT_PATH=$TRANSCRIPT — skip"
+    log "no transcript at transcript_path=$TRANSCRIPT — skip"
     # PREFILTER_ONLY mode: no transcript → prefilter fails (exit 1)
     [[ "${PREFILTER_ONLY:-0}" == "1" ]] && exit 1
     exit 0
@@ -172,14 +199,14 @@ fi
 # Errors from the background process are appended to $LOG_FILE for review.
 # Per spec §9: always exit 0 from the hook — never block the session.
 # ---------------------------------------------------------------------------
-log "prefilter passed — invoking classifier (session=${CLAUDE_SESSION_ID:-unknown})"
+log "prefilter passed — invoking classifier (session=$SESSION_ID)"
 (
     cd "$PLUGIN_ROOT"
     python3 -m pipeline.runner \
         --mode "stop" \
         --transcript "$TRANSCRIPT" \
-        --session-id "${CLAUDE_SESSION_ID:-unknown}" \
-        --cwd "${CLAUDE_PROJECT_DIR:-$PWD}" \
+        --session-id "$SESSION_ID" \
+        --cwd "$PROJECT_DIR" \
         2>>"$LOG_FILE"
 ) &
 
