@@ -15,6 +15,7 @@ from pipeline.classifier import (
     Classifier,
     parse_haiku_yaml_output,
     build_marker_candidate,
+    _is_empty_haiku_response,
 )
 
 
@@ -173,6 +174,85 @@ class TestClassifierEdgeCases(unittest.TestCase):
             self.assertEqual(len(cands), 1)
             # Tags must be a real list of strings, NOT a character-decomposed list
             self.assertEqual(cands[0].tags, ["opal", "syntax"])
+
+
+class TestEmptyHaikuResponse(unittest.TestCase):
+    """Regression tests for _is_empty_haiku_response — added after T17 found
+    that real Haiku returns fenced empty-list + trailing prose when it
+    decides "this fact is already captured".
+    """
+
+    def test_bare_empty_list(self):
+        self.assertTrue(_is_empty_haiku_response("[]"))
+        self.assertTrue(_is_empty_haiku_response("  []  "))
+
+    def test_bare_null(self):
+        self.assertTrue(_is_empty_haiku_response("null"))
+        self.assertTrue(_is_empty_haiku_response("~"))
+
+    def test_empty_string(self):
+        self.assertTrue(_is_empty_haiku_response(""))
+        self.assertTrue(_is_empty_haiku_response("   \n  "))
+
+    def test_fenced_empty_list(self):
+        """Common Haiku wrapping — observed in T17 real-Haiku runs."""
+        self.assertTrue(_is_empty_haiku_response("```yaml\n[]\n```"))
+        self.assertTrue(_is_empty_haiku_response("```\n[]\n```"))
+
+    def test_fenced_empty_list_with_trailing_prose(self):
+        """T17 production finding: Haiku may explain why no candidates."""
+        response = (
+            "```yaml\n"
+            "[]\n"
+            "```\n"
+            "\n"
+            "This fact is already captured in the existing knowledge base."
+        )
+        self.assertTrue(
+            _is_empty_haiku_response(response),
+            "Fenced empty-list followed by explanation must be recognized "
+            "as empty — otherwise classifier emits spurious self-error markers"
+        )
+
+    def test_real_candidate_is_not_empty(self):
+        """A real candidate response must NOT register as empty."""
+        response = (
+            "```yaml\n"
+            "- title: T\n"
+            "  fact: f\n"
+            "  proposed_section: X\n"
+            "  confidence: high\n"
+            "  tags: [opal]\n"
+            "```"
+        )
+        self.assertFalse(_is_empty_haiku_response(response))
+
+    @mock.patch("pipeline.classifier._invoke_haiku")
+    def test_classify_with_fenced_empty_plus_prose_no_marker(self, mock_invoke):
+        """End-to-end: a real-world dedup-style Haiku response must produce
+        zero candidates, NOT a self-error marker. This is the bug T17 found.
+        """
+        mock_invoke.return_value = (
+            "```yaml\n"
+            "[]\n"
+            "```\n"
+            "\n"
+            "This fact is already in the Already known section."
+        )
+        with tempfile.TemporaryDirectory() as d:
+            obs = Path(d) / "ObserveIE.md"
+            obs.write_text("# ObserveIE\n", encoding="utf-8")
+            c = Classifier(
+                model="m",
+                prompt_template_path=_prompts_dir() / "classifier.md",
+                observeie_md_path=obs,
+            )
+            cands = c.classify(turn_text="x", session_id="s", cwd="/c")
+        self.assertEqual(cands, [],
+            "Fenced-empty + prose must produce zero candidates, not a "
+            "self-error marker — otherwise pending file fills with noise "
+            "after every dedup-positive session."
+        )
 
 
 def _prompts_dir() -> Path:

@@ -94,10 +94,13 @@ class Classifier:
             ]
 
         raw_candidates = parse_haiku_yaml_output(haiku_output)
-        if not raw_candidates and haiku_output.strip() and haiku_output.strip() != "[]":
+        if not raw_candidates and not _is_empty_haiku_response(haiku_output):
             # Haiku returned something the parser couldn't parse —
-            # non-empty, non-"[]", but no candidates extracted.
+            # non-empty/non-empty-list (after fence stripping), but no candidates extracted.
             # Log the first 200 chars for diagnostics; surface a marker.
+            # WHY use _is_empty_haiku_response: Haiku may wrap "[]" in ```yaml fences.
+            # haiku_output.strip() != "[]" would fire spuriously on "```yaml\n[]\n```".
+            # The helper normalises both fenced and bare empty-list responses.
             print(
                 f"[observe-learning-capture] classifier.py: malformed yaml "
                 f"from haiku for session={session_id}",
@@ -198,6 +201,54 @@ def _split_haiku_list(yaml_list: str) -> List[str]:
     if current:
         items.append("\n".join(current))
     return items
+
+
+def _is_empty_haiku_response(raw_output: str) -> bool:
+    """Return True if the raw Haiku response represents "no candidates found".
+
+    Haiku may signal an empty result in several equivalent forms:
+      - bare empty string
+      - "[]" (bare YAML empty list)
+      - "null" or "~" (YAML null)
+      - "```yaml\\n[]\\n```" (fenced empty list — the common Haiku wrapping)
+      - "```yaml\\n[]\\n```\\n\\nExplanatory prose..." (fenced empty list
+        followed by an explanation — observed in T17 real-Haiku runs when
+        Haiku knows the fact is already captured and explains why)
+
+    WHY needed: the malformed-yaml guard in classify() compares against the
+    RAW output string before fence stripping. Without this helper, a fenced
+    "[]" followed by explanation prose triggers a spurious malformed-yaml
+    marker because the raw string is neither empty nor literally "[]".
+
+    Strategy: extract just the YAML content block (between/without fences)
+    and check if its stripped first token is an empty-list signal. Any
+    trailing prose after the closing fence is explanatory and is ignored.
+
+    Args:
+        raw_output: The raw stdout string from the `claude` CLI.
+
+    Returns:
+        True if the response is an empty-candidates signal; False otherwise.
+    """
+    stripped = raw_output.strip()
+    if not stripped or stripped in ("[]", "null", "~"):
+        return True
+
+    # Extract just the fenced YAML block content (first code block, if any).
+    # WHY first block: Haiku sometimes appends prose after the closing fence.
+    # We only care about the YAML block — prose after it is not a parse error.
+    fence_match = re.search(
+        r"^```(?:yaml)?\s*\n(.*?)\n```",
+        stripped,
+        flags=re.DOTALL | re.MULTILINE,
+    )
+    if fence_match:
+        yaml_content = fence_match.group(1).strip()
+    else:
+        # No fences — the entire output is the YAML content.
+        yaml_content = stripped
+
+    return not yaml_content or yaml_content in ("[]", "null", "~")
 
 
 def _build_prompt(
