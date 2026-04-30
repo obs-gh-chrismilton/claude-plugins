@@ -35,6 +35,17 @@ Do NOT capture:
 
 Return a YAML list. One document per candidate. Empty list if no candidates.
 
+**`proposed_section` must match an existing section from "Already known" below
+when the topic fits one.** Section names already in use (canonical):
+- `OPAL Gotchas` — OPAL syntax quirks, time literals, verb behavior
+- `Object Management and Cleanup` — delete mutations, cascade rules, object lifecycle, app uninstall behavior, retention
+- `API/GraphQL` — endpoint behavior, error shapes, authentication, mutation signature discovery
+- `Observe CLI` — CLI subcommands, flags, debug behavior
+
+Only invent a new section name when none of the above (or others present in
+"Already known") fit. Consistent section names matter for the human reviewer
+who eventually merges candidates into the canonical knowledge file.
+
 Example output:
 
 ```yaml
