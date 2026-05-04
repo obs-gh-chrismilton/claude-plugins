@@ -1490,6 +1490,18 @@ def _generate_slim_known_facts(observeie_md_path: Path) -> str:
         return "(empty — ObserveIE.md unreadable)"
 
     # Walk the file, tracking current section header and collecting ids.
+    # Real ObserveIE.md format is: `<!-- id:c4f9d2a1 captured:2026-05-01 ... -->`
+    # i.e. no space after `id:`, the 8-char hash is followed by ` captured:...`
+    # rather than `-->`. Use a tolerant regex that accepts:
+    #   <!-- id:abcd1234 -->
+    #   <!-- id: abcd1234 -->
+    #   <!-- id:abcd1234 captured:2026-05-01 -->
+    #   <!--id:abcd1234-->
+    # Verified against /Users/chmilton/.claude/agents/ObserveIE.md format
+    # during validator review (executor agent confirmed real format).
+    import re
+    ID_RE = re.compile(r"<!--\s*id:\s*([0-9a-f]{6,16})\b")
+
     sections: dict[str, list[str]] = {}
     current_section: Optional[str] = None
     for line in text.splitlines():
@@ -1497,12 +1509,9 @@ def _generate_slim_known_facts(observeie_md_path: Path) -> str:
             current_section = line[3:].strip()
             sections.setdefault(current_section, [])
         elif current_section is not None:
-            # Match lines of the form `<!-- id: abcd1234 -->`
-            stripped = line.strip()
-            if stripped.startswith("<!-- id:") and stripped.endswith("-->"):
-                # Extract the id hash between "id:" and "-->"
-                id_part = stripped[len("<!-- id:"):-len("-->")].strip()
-                sections[current_section].append(id_part)
+            m = ID_RE.search(line)
+            if m:
+                sections[current_section].append(m.group(1))
 
     if not sections:
         return "(empty — no sections found in ObserveIE.md)"
@@ -1608,10 +1617,15 @@ class TestSDKInvocation(unittest.TestCase):
         )
 
         self.assertEqual(result, "[]")
-        # Verify SDK was called with layered system blocks + cache_control
+        # Verify Anthropic() constructor got max_retries=0
+        # (NOT messages.create() — that would TypeError; validator caught this)
+        ctor_kwargs = mock_client_cls.call_args.kwargs
+        self.assertEqual(ctor_kwargs.get("max_retries"), 0)
+        # Verify messages.create was called with the layered system blocks
         call_kwargs = mock_client.messages.create.call_args.kwargs
         self.assertEqual(call_kwargs["model"], "claude-sonnet-4-5")
-        self.assertEqual(call_kwargs["max_retries"], 0)
+        # max_retries should NOT appear in create() kwargs
+        self.assertNotIn("max_retries", call_kwargs)
         system = call_kwargs["system"]
         self.assertEqual(len(system), 2)
         self.assertEqual(system[0]["type"], "text")
@@ -1765,8 +1779,13 @@ def _invoke_classifier(
     cache_control: ephemeral on both system blocks. Sonnet 4.5's 1024-token
     cache minimum lets the slim payload (~1KB) actually cache, unlike
     Haiku 4.5's 4096-token min which would silently no-op.
+
+    NOTE: max_retries is an Anthropic() constructor arg, NOT a
+    messages.create() kwarg. Validator caught this during plan review —
+    passing max_retries to create() raises TypeError on first call.
     """
-    client = anthropic.Anthropic()  # auto-loads ANTHROPIC_API_KEY
+    # max_retries=0 on the client (constructor) — NOT on messages.create()
+    client = anthropic.Anthropic(max_retries=0)  # auto-loads ANTHROPIC_API_KEY
     response = client.messages.create(
         model=model,
         max_tokens=2048,
@@ -1784,7 +1803,6 @@ def _invoke_classifier(
         ],
         messages=[{"role": "user", "content": user_message}],
         timeout=120,
-        max_retries=0,
     )
     # Defensive content extraction — handles thinking blocks, multi-block responses
     text_output = next(
@@ -1912,11 +1930,41 @@ python3 -m unittest tests.test_classifier_sdk_errors -v 2>&1 | tail -30
 python3 -m unittest discover tests 2>&1 | tail -5
 ```
 
-Expected: all `TestSDKInvocation` (2) and `TestClassifyExceptionHandling` (5) tests PASS. Existing `test_classifier.py` tests for `_invoke_haiku` may now FAIL — those existing tests need updating to mock the new SDK path or be removed. Update or remove the existing `test_classifier.py` tests that reference `_invoke_haiku` directly:
-  - Open `tests/test_classifier.py`, find tests that `@mock.patch("pipeline.classifier._invoke_haiku")`
-  - Either update them to mock `_invoke_classifier` instead, or remove them if they're now superseded by the new tests in `test_classifier_sdk_errors.py`.
+Expected: all `TestSDKInvocation` (2) and `TestClassifyExceptionHandling` (5) tests PASS. Existing tests that mock `_invoke_haiku` or the old single-string `_build_prompt` will now FAIL — they MUST be updated. Validator review identified THREE files with such mocks:
 
-Re-run after fixing:
+  **All three files need updating in this step (validator caught these gaps):**
+
+  1. **`tests/test_classifier.py`** — open the file; find every `@mock.patch("pipeline.classifier._invoke_haiku")` and rewrite to `@mock.patch("pipeline.classifier._invoke_classifier")`. The new mock signature returns a 2-tuple `(text, usage)` — update mock return values:
+     ```python
+     # Before:
+     _invoke.return_value = "[]"
+     # After:
+     mock_usage = mock.Mock(cache_read_input_tokens=0, cache_creation_input_tokens=0)
+     _invoke.return_value = ("[]", mock_usage)
+     ```
+  2. **`tests/test_e2e.py`** — has 3 `_invoke_haiku` references (around lines 36, 109, 135 per validator). Same rewrite as above. Also: any test that mocks `_build_prompt` must update the mock to return a 3-tuple `(static, slim, user)` instead of a single string.
+  3. **`tests/test_classifier_per_record_marker.py`** (created in Task 2) — mocks BOTH `_invoke_haiku` AND `_build_prompt`. Same rewrite needed:
+     ```python
+     # Before:
+     @mock.patch("pipeline.classifier._invoke_haiku")
+     @mock.patch("pipeline.classifier._build_prompt")
+     # ...
+     _invoke.return_value = """- title: ..."""
+     _build.return_value = "irrelevant prompt"
+
+     # After:
+     @mock.patch("pipeline.classifier._invoke_classifier")
+     @mock.patch("pipeline.classifier._build_prompt")
+     @mock.patch("pipeline.classifier._generate_slim_known_facts", return_value="(empty)")
+     # ...
+     mock_usage = mock.Mock(cache_read_input_tokens=0, cache_creation_input_tokens=0)
+     _invoke.return_value = ("""- title: ...""", mock_usage)
+     _build.return_value = ("static template", "slim known facts", "user message")
+     ```
+
+  Also: any test that monkeypatches the now-deleted `_read_safe` should be removed (Task 11 deletes the function; reference would NameError).
+
+Re-run after fixing all three files:
 
 ```bash
 python3 -m unittest discover tests 2>&1 | tail -5
@@ -2005,13 +2053,16 @@ class TestCacheWarning(unittest.TestCase):
 
     def _make_classifier(self):
         from pipeline.classifier import Classifier
+        # Inject test-isolated pending_path AND sentinel (both must be
+        # tmp dir to prevent polluting the user's real ~/.claude state)
+        pending = Path(self._tmp.name) / "pending.md"
         clf = Classifier(
             model="claude-sonnet-4-5",
             prompt_template_path=Path("/nonexistent.md"),
             observeie_md_path=Path("/nonexistent.md"),
             prompt_version="test",
+            pending_path=pending,
         )
-        # Reset call counter
         clf._cache_call_count = 0
         clf._cache_sentinel_path = self.sentinel
         return clf
@@ -2089,11 +2140,16 @@ class Classifier:
     prompt_template_path: Path
     observeie_md_path: Path
     prompt_version: str = "1.0"
+    pending_path: Path = field(default_factory=lambda: Path(
+        os.path.expanduser("~/.claude/agents/.observeie-pending.md")
+    ))
     _cache_call_count: int = 0
     _cache_sentinel_path: Path = field(default_factory=lambda: Path(
         os.path.expanduser("~/.claude/agents/.observe-cache-warned")
     ))
 ```
+
+**IMPORTANT (validator correction):** `pending_path` is now an injected dataclass field. Previous draft hardcoded `~/.claude/agents/.observeie-pending.md` inside `_maybe_emit_cache_warning`, which would have caused tests to pollute the user's REAL pending file. Runner.py must construct `Classifier(..., pending_path=pending_path)` — update Task 10 Step 10.3 accordingly when you reach it.
 
 Add `from dataclasses import dataclass, field` and `import os` if not already imported.
 
@@ -2138,9 +2194,11 @@ Now replace the `_maybe_emit_cache_warning` method:
         if self._cache_sentinel_path.exists():
             return  # already warned; don't spam
 
-        # Emit one-shot marker
+        # Emit one-shot marker — uses injected pending_path, NOT hardcoded
+        # (validator caught the hardcoded path was polluting tests' real
+        # pending file and was an architectural violation).
         from pipeline.stage import append_candidates
-        pending_path = Path(os.path.expanduser("~/.claude/agents/.observeie-pending.md"))
+        pending_path = self.pending_path
         marker = build_marker_candidate(
             failure_reason=(
                 f"cache disabled: prefix below threshold "
@@ -2322,7 +2380,10 @@ def main_with_args(
         transcript_path = Path(transcript)
 
         if mode == "stop":
-            turn = current_logical_turn(transcript_path)
+            # TODO Task 14: swap last_assistant_turn -> current_logical_turn
+            # (current_logical_turn is created in Task 13; using the existing
+            # primitive here keeps the test suite green between Tasks 10-13.)
+            turn = last_assistant_turn(transcript_path)
             if turn is None:
                 return 0
             turn_text = turn.text
@@ -2373,30 +2434,20 @@ def main_with_args(
         return 0
 ```
 
-You'll need to add the imports at the top of `runner.py`:
-```python
-from pipeline.transcript import current_logical_turn, all_assistant_turns
-from pipeline.dedupe import extract_existing_ids, is_duplicate
-from pipeline.stage import append_candidates, read_pending
-```
+**IMPORTANT — order of operations (validator caught a top-down readability hazard).** `current_logical_turn` doesn't exist yet — Tasks 12-13 create it. For Task 10, do this:
 
-(Some of these may already be imported; deduplicate if so.)
+1. Use `last_assistant_turn` in the runner code below (NOT `current_logical_turn`).
+2. Add the import accordingly:
+   ```python
+   from pipeline.transcript import last_assistant_turn, all_assistant_turns
+   from pipeline.dedupe import extract_existing_ids, is_duplicate
+   from pipeline.stage import append_candidates, read_pending
+   ```
+   (Some may already be imported — dedupe.)
+3. Mark the callsite with `# TODO Task 14: swap to current_logical_turn`.
+4. Task 14 swaps `last_assistant_turn` → `current_logical_turn` after Task 13 creates the function.
 
-**Note:** `current_logical_turn` doesn't exist YET — that's Tasks 12-13. For now, leave the import in place; the tests in this Task don't exercise that code path. Tasks 12-13 will add the function.
-
-Actually, since `current_logical_turn` is called from `main_with_args`, importing it now will cause an `ImportError` until Task 12. Workaround for Task 10: add the import behind a `try`/`except ImportError` guard, OR temporarily keep using `last_assistant_turn` and fix in Task 14. Cleaner: temporarily use `last_assistant_turn` here, add a `# TODO Task 14: swap to current_logical_turn` comment, swap in Task 14.
-
-Replace the line `turn = current_logical_turn(transcript_path)` with:
-```python
-            turn = last_assistant_turn(transcript_path)  # TODO Task 14: swap to current_logical_turn
-```
-
-And import accordingly:
-```python
-from pipeline.transcript import last_assistant_turn, all_assistant_turns
-```
-
-Task 14 will perform the swap.
+The runner snippet in Step 10.3 already uses `last_assistant_turn` with the TODO comment — just be sure your import line matches (`last_assistant_turn`, NOT `current_logical_turn`).
 
 - [ ] **Step 10.4: Run tests to verify**
 
@@ -2445,11 +2496,22 @@ EOF
 **Files:**
 - Modify: `pipeline/classifier.py` (remove dead code)
 
-- [ ] **Step 11.1: Remove dead functions**
+- [ ] **Step 11.1: Remove dead functions (be specific — KEEP everything else)**
 
-In `pipeline/classifier.py`, delete:
+In `pipeline/classifier.py`, delete ONLY:
 - `_invoke_haiku` function (no longer called — `_invoke_classifier` replaced it)
 - `_read_safe` function (no longer called — `_generate_slim_known_facts` handles its own read)
+
+**KEEP these (they are still called by the new code path — validator caught this gap):**
+- `_is_empty_haiku_response` — called by `Classifier.classify` to gate marker emission on truly-empty responses
+- `parse_haiku_yaml_output` — called by `Classifier.classify` to parse the SDK response text into raw candidate dicts
+- `_split_haiku_list` — called by `parse_haiku_yaml_output`
+- `_raw_to_candidate` — called by the per-record loop in `Classifier.classify`
+- `build_marker_candidate` — called from many places (classifier + runner outer catch + auth precheck + cache visibility)
+- `_sanitize` (Task 1) — called by `build_marker_candidate`
+- `_generate_slim_known_facts` (Task 7) — called by `Classifier.classify`
+- `_build_prompt` (Task 7 refactored shape) — called by `Classifier.classify`
+- `_invoke_classifier` (Task 8) — called by `Classifier.classify`
 
 Also remove the `import subprocess` line at the top if no other code uses it (search the file: `grep subprocess pipeline/classifier.py` — should now return nothing).
 
@@ -2937,16 +2999,22 @@ EOF
 
 In `pipeline/runner.py`:
 
-a) Update the import:
+a) Update the import (replace `last_assistant_turn` with `current_logical_turn`):
 ```python
 from pipeline.transcript import current_logical_turn, all_assistant_turns
 ```
-(Drop `last_assistant_turn` if no longer referenced.)
 
-b) Replace the line marked `# TODO Task 14: swap to current_logical_turn`:
+b) Replace the lines marked `# TODO Task 14: swap to current_logical_turn`:
 ```python
+        if mode == "stop":
             turn = current_logical_turn(transcript_path)
+            if turn is None:
+                return 0
+            turn_text = turn.text
+            excerpt = turn.text[:200]
 ```
+
+(The TODO comment block AND the `last_assistant_turn` call both go; only `current_logical_turn` remains.)
 
 - [ ] **Step 14.2: Run full test suite to verify**
 
@@ -3440,3 +3508,63 @@ Plan complete and saved to `plugins/observe-learning-capture/docs/recovery-imple
 **2. Inline Execution** — Execute Tasks sequentially in the current session via `superpowers:executing-plans`. Batches with checkpoints. Best if you want to drive each Task interactively.
 
 **Which approach?**
+
+---
+
+## Appendix: Validator Findings & Corrections
+
+This plan was reviewed by four independent agents with distinct lenses (executor's-eye-view, TDD test quality, code correctness, sequencing/dependency). Their findings drove inline corrections throughout this document. This appendix documents what was caught for audit purposes.
+
+### Verdicts (round 1)
+
+| Lens | Agent type | Verdict |
+|------|-----------|---------|
+| Executor's-eye-view | `general-purpose` | EXECUTABLE WITH FIXES |
+| TDD test quality | `pr-review-toolkit:pr-test-analyzer` | TESTS NEED FIXES |
+| Code correctness | `pr-review-toolkit:code-reviewer` | CODE NEEDS FIXES (one CRITICAL won't run) |
+| Sequencing/dependency | `general-purpose` | SEQUENCING HAS GAPS |
+
+### CRITICAL findings — fixed inline
+
+| # | Finding | Resolution |
+|---|---------|-----------|
+| 1 | `_generate_slim_known_facts` parsed `<!-- id: <hash> -->` literal but real ObserveIE.md uses `<!-- id:c4f9d2a1 captured:... -->` (no space, hash followed by metadata). Would extract zero ids. | Task 7 Step 7.4: replaced literal prefix/suffix with regex `<!--\s*id:\s*([0-9a-f]{6,16})\b`. |
+| 2 | `max_retries=0` passed to `messages.create()` (it's an `Anthropic()` constructor arg). TypeError on first call. | Task 8 Step 8.3: moved to `anthropic.Anthropic(max_retries=0)` in `_invoke_classifier`; updated test in Step 8.1 to assert ctor kwarg, not create kwarg. |
+| 3 | `_maybe_emit_cache_warning` wrote to hardcoded `~/.claude/agents/.observeie-pending.md` — would pollute user's real pending file during tests; architectural violation. | Task 9 Step 9.3: added `pending_path: Path` as injected dataclass field on `Classifier`; updated `_make_classifier` test helper to inject tmp path; runner.py constructs Classifier with `pending_path=pending_path`. |
+| 4 | Plan's Task 8.4 only enumerated `tests/test_classifier.py` — but `tests/test_e2e.py` (3 mocks) AND `tests/test_classifier_per_record_marker.py` (Task 2's own file) also mock `_invoke_haiku`/old `_build_prompt`. Suite would go RED at Task 8. | Task 8 Step 8.4: expanded to enumerate ALL THREE files with explicit mock-rewrite snippets for each. |
+
+### HIGH findings — fixed inline
+
+| # | Finding | Resolution |
+|---|---------|-----------|
+| 5 | Task 11 "remove dead code" too vague — could delete still-needed helpers (`_is_empty_haiku_response`, `parse_haiku_yaml_output`, `_split_haiku_list`, `_raw_to_candidate`, `build_marker_candidate`). | Task 11 Step 11.1: added explicit KEEP list with 9 functions named. |
+| 6 | Task 10 import block showed broken `current_logical_turn` import then backtracked — top-down readers hit broken import first. | Task 10 Step 10.3: restructured. Lead with the `last_assistant_turn` workaround; backtrack/explanation removed. Body of `main_with_args` now consistent with import (uses `last_assistant_turn` + TODO comment). Task 14 updated to remove the TODO block in addition to the import. |
+
+### Findings deferred to executor judgment (MEDIUM/LOW)
+
+These are real but small enough that the executor can apply judgment in-flight without a plan rewrite. Be aware of them while executing:
+
+- **Task 6 — `anthropic.AuthenticationError(response=mock.Mock(status_code=401))` may not construct cleanly under real SDK signature.** If construction fails in the test, it fails for the wrong reason. If the executor encounters this, mock with `mock.Mock(spec=httpx.Response)` and proper `status_code` attribute, or use `AuthenticationError.__new__(AuthenticationError)` with attributes set directly.
+- **Task 13 — drift-detection marker for unknown user-record kinds is not yet wired.** Spec §7 Bug 1 mentions this. `_is_real_user_prompt` returns boolean only; emitting a marker would require importing `build_marker_candidate` into transcript.py (architectural smell — transcript shouldn't import classifier). Resolution path: either (a) move the drift marker emission into `current_logical_turn` itself with a callback parameter, or (b) emit the marker from the runner side after `current_logical_turn` returns. Defer the decision until executor reaches Task 13; the spec marker text is `"unknown user-record kind: <first 80 chars>"`.
+- **Task 3 — `read_pending` may not actually raise on the malformed-YAML test fixture.** If the executor finds the test passes-without-failure when the implementation is broken, swap the fixture to genuinely-malformed input (e.g., `"\x00\x01binary"`) or mock `read_pending` to raise.
+- **Task 4 — `provenance` vs `source` field naming.** `read_pending` records may use either key depending on era. The render code already has fallback `r.get("provenance", r.get("source", {}))`. Test fixture in Step 3.1 uses `provenance:` — either keep it or switch to `source:`; both work with the fallback.
+- **Task 1 — `_sanitize` `repr().strip("'\"")[:200]` edge case.** For inputs that contain literal quote characters, repr's outer quote choice + strip behavior can be surprising. Low impact; flag for awareness.
+- **Task 16 — `unset ANTHROPIC_API_KEY` line is decorative.** The actual env stripping happens via `os.environ.pop(...)` inside the inline Python. Drop the bash `unset` line; the comment was misleading.
+- **Test fixtures shared across tests** — `tests/fixtures/test_classifier_template.md` is written by multiple tests at the same path (race risk under parallel runs). Use `tempfile.TemporaryDirectory()` per test if running with parallel test runners.
+- **Task 7 / Task 8 sequencing** — Task 7 changes `_build_prompt` signature but doesn't rewrite `Classifier.classify` body until Task 8. The suite "passes" between them only because tests mock around the broken integration. Acceptable since unit-tested helpers are still correct; integration is exercised end-to-end only after Task 8.
+
+### What the validators agreed the plan got RIGHT
+
+- Bug 3 (sanitation) sequenced first → unblocks visibility for debugging Bugs 2/5
+- Bug 5 (per-record marker) sequenced early → small, low-risk, gains visibility into Haiku output edge cases
+- Bug 4 (render module) sequenced before manual verification → markers actually surface for Task 16 exercises
+- Bug 2 (SDK rewrite) sequenced before Bug 1 → manual verification of Bug 1 needs SDK call working
+- Task 14 callsite swap correctly placed AFTER Task 13 creates `current_logical_turn`
+- Task 11 cleanup deferred until after all Bug 2 tests pass
+- Defensive content extraction `next((b.text for b in response.content if getattr(b,'type',None)=='text'), "")` handles thinking blocks correctly
+- `build_marker_candidate` boundary sanitation (one chokepoint, both `fact` and `excerpt` benefit) is correct architectural choice
+- `_invoke_classifier` returns `(text, usage)` tuple → enables cache-visibility wiring without violating the existing function's contract
+- `pipeline/render_pending.py` `RENDER FAILED` block + always-exit-0 → correct surface-don't-swallow pattern preserving hook contract
+- Back-compat `config.get("classifier_model", config.get("haiku_model", ...))` chain correctly preserves existing config files
+- Auth precheck via `client.models.list(limit=1)` — correct choice (free, doesn't 404 on alias)
+- Tests well-designed and worth preserving (per validator): `test_sanitized_marker_round_trips_through_yaml`, `test_assistant_record_returns_false`, `test_walks_through_clear_command_records`, `test_returns_none_when_no_assistant_text_in_turn`, `test_sentinel_self_heals_on_cache_hit`, `test_missing_pending_file_produces_no_output`
