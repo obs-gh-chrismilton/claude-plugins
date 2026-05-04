@@ -89,7 +89,7 @@ def main() -> int:
     plugin_root = Path(__file__).parent.parent
 
     classifier = Classifier(
-        model=config["haiku_model"],
+        model=config.get("classifier_model", config.get("haiku_model", "claude-sonnet-4-5")),
         prompt_template_path=plugin_root / "prompts" / "classifier.md",
         observeie_md_path=destination_path,
         prompt_version=config["prompt_version"],
