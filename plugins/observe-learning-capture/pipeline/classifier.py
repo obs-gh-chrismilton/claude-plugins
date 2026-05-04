@@ -6,10 +6,11 @@ human sees the failure at next review (per spec §9 — log AND surface).
 """
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, List, Optional
@@ -38,21 +39,37 @@ def _sanitize(reason: object) -> str:
 
 @dataclass
 class Classifier:
-    """Orchestrates Haiku invocations to produce Candidate objects.
+    """Orchestrates Anthropic SDK invocations to produce Candidate objects.
 
     Attributes:
-        model: Claude model ID string (e.g. "claude-haiku-4-5-20251001").
-        prompt_template_path: Path to the classifier.md prompt template.
-        observeie_md_path: Path to ObserveIE.md — already-known content
-            injected into the prompt so Haiku avoids re-capturing known facts.
+        model: Claude model ID (e.g. "claude-sonnet-4-5").
+        prompt_template_path: Path to the static classifier prompt template.
+        observeie_md_path: Path to ObserveIE.md — slim known-facts derived
+            from this so Haiku/Sonnet avoids re-capturing known facts.
         prompt_version: Version label embedded in ClassifierMeta for each
             produced candidate, so prompts can be retro-evaluated later.
+        pending_path: Where marker candidates are appended on failure.
+            Injected (NOT hardcoded) so tests use a tmp path and never
+            pollute the user's real ~/.claude/agents/.observeie-pending.md.
+        _cache_call_count: Counter of consecutive calls observed with
+            cache_read_input_tokens == 0. Reset on first cache hit.
+        _cache_sentinel_path: One-shot marker file. When present, the
+            cache-disabled warning has already been emitted and we skip
+            re-emission. Deleted on first observed cache hit so the
+            warning re-fires if the situation regresses.
     """
 
     model: str
     prompt_template_path: Path
     observeie_md_path: Path
     prompt_version: str = "1.0"
+    pending_path: Path = field(default_factory=lambda: Path(
+        os.path.expanduser("~/.claude/agents/.observeie-pending.md")
+    ))
+    _cache_call_count: int = 0
+    _cache_sentinel_path: Path = field(default_factory=lambda: Path(
+        os.path.expanduser("~/.claude/agents/.observe-cache-warned")
+    ))
 
     def classify(
         self,
@@ -159,9 +176,66 @@ class Classifier:
                 continue
         return result
 
-    def _maybe_emit_cache_warning(self, usage, session_id, cwd, captured_at):
-        """Stub for Task 9 cache visibility — implemented next."""
-        pass
+    def _maybe_emit_cache_warning(
+        self,
+        usage,
+        session_id: str,
+        cwd: str,
+        captured_at: datetime,
+    ) -> None:
+        """Surface a marker if prompt cache silently no-ops.
+
+        Per silent-failure-hunter review: if our prompt is below the model's
+        cache minimum (1024 tokens for Sonnet 4.5), cache_control markers
+        silently no-op — cache_creation_input_tokens=0, no error raised.
+        Classifier "succeeds" but pays full input cost forever with no signal.
+
+        Strategy: after 5 calls with cache_read_input_tokens consistently 0,
+        emit a one-shot marker via sentinel file. Self-healing: sentinel is
+        deleted on first observed cache_read>0 so the warning re-fires if
+        the situation regresses.
+        """
+        cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
+
+        if cache_read > 0:
+            # Caching IS working — heal any prior warning sentinel
+            if self._cache_sentinel_path.exists():
+                try:
+                    self._cache_sentinel_path.unlink()
+                except OSError:
+                    pass  # best-effort heal
+            return
+
+        # Cache not hitting on this call
+        self._cache_call_count += 1
+        if self._cache_call_count < 5:
+            return  # not enough evidence yet
+
+        if self._cache_sentinel_path.exists():
+            return  # already warned; don't spam
+
+        # Emit one-shot marker — uses injected pending_path, NOT hardcoded
+        # (validator caught the hardcoded path was polluting tests' real
+        # pending file and was an architectural violation).
+        from pipeline.stage import append_candidates
+        pending_path = self.pending_path
+        marker = build_marker_candidate(
+            failure_reason=(
+                f"cache disabled: prefix below threshold "
+                f"({self._cache_call_count} calls × 0 cache reads)"
+            ),
+            session_id=session_id, cwd=cwd, captured_at=captured_at,
+        )
+        try:
+            append_candidates(pending_path, [marker])
+            self._cache_sentinel_path.parent.mkdir(parents=True, exist_ok=True)
+            self._cache_sentinel_path.touch()
+        except Exception as exc:
+            print(
+                f"[observe-learning-capture] classifier.py: cache-warning "
+                f"emission failed: {exc}",
+                file=sys.stderr,
+            )
 
 
 def parse_haiku_yaml_output(output: str) -> List[dict[str, Any]]:
