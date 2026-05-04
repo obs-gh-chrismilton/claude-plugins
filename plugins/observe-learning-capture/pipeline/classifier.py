@@ -139,14 +139,20 @@ class Classifier:
                     model=self.model, prompt_version=self.prompt_version,
                 ))
             except (KeyError, ValueError) as e:
-                # Skip malformed individual records but log so nothing is
-                # silently dropped. WHY: one bad record shouldn't block
-                # the rest of the batch.
+                # Bug 5 fix: emit a marker per malformed record so failures
+                # surface at /observe-review time. Previous behavior silently
+                # dropped the record (logged to stderr only). One bad record
+                # still doesn't block the rest of the batch.
                 print(
-                    f"[observe-learning-capture] classifier.py: skipped "
-                    f"malformed candidate record: {e}",
+                    f"[observe-learning-capture] classifier.py: malformed "
+                    f"candidate record: {e}",
                     file=sys.stderr,
                 )
+                result.append(build_marker_candidate(
+                    failure_reason=f"malformed candidate record: missing field {e}",
+                    session_id=session_id, cwd=cwd,
+                    captured_at=captured_at,
+                ))
                 continue
         return result
 
