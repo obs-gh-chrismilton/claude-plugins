@@ -371,3 +371,72 @@ class TestClassifyExceptionHandling(unittest.TestCase):
         self.assertEqual(len(candidates), 1)
         self.assertLess(len(candidates[0].fact), 250,
                         f"fact too long: {len(candidates[0].fact)}")
+
+
+class TestRunnerOuterCatchEmitsMarker(unittest.TestCase):
+    """Runner's outer ``except Exception`` previously logged + returned 0
+    silently. Bug 2 fix part: must emit a marker so unexpected failures
+    surface at /observe-review.
+
+    The test patches ``_auth_precheck`` to return True (so we exercise the
+    classifier-construction path) and then makes ``Classifier(...)`` raise
+    an unexpected ``RuntimeError``. The runner must:
+
+      1. Catch the error in its outer except block.
+      2. Append a marker candidate to the configured pending file.
+      3. Return exit code 0 so the hook subshell stays clean.
+    """
+
+    @mock.patch("pipeline.runner.Classifier")
+    @mock.patch("pipeline.runner._auth_precheck", return_value=True)
+    def test_unexpected_classifier_construction_error_emits_marker(
+        self, _precheck, mock_clf_cls
+    ):
+        from pipeline import runner
+
+        # Force Classifier(...) construction to blow up with an unexpected
+        # exception type. Outer except must catch it and emit a marker.
+        mock_clf_cls.side_effect = RuntimeError(
+            "classifier broken in unexpected way"
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            transcript = Path(td) / "transcript.jsonl"
+            # Minimal valid transcript: one user turn + one substantive
+            # assistant turn so last_assistant_turn returns non-None even
+            # though we never get that far (Classifier explodes first).
+            transcript.write_text(
+                '{"type":"user","message":{"content":"hello"},"uuid":"u1","timestamp":"2026-05-04T10:00:00Z"}\n'
+                '{"type":"assistant","message":{"content":[{"type":"text","text":"reply with substantive content " * 20}]},"uuid":"a1","timestamp":"2026-05-04T10:00:01Z"}\n'
+            )
+            pending = Path(td) / "pending.md"
+            destination = Path(td) / "ObserveIE.md"
+            destination.write_text("")
+
+            # Override config to point at temp paths so we don't pollute
+            # the real ~/.claude/agents/.observeie-pending.md.
+            with mock.patch(
+                "pipeline.runner._load_config",
+                return_value={
+                    "destination_file": str(destination),
+                    "pending_file": str(pending),
+                    "classifier_model": "claude-sonnet-4-5",
+                    "prompt_version": "test",
+                },
+            ):
+                rc = runner.main_with_args(
+                    mode="stop",
+                    transcript=str(transcript),
+                    session_id="test-session",
+                    cwd="/test",
+                )
+
+            # IMPORTANT: assertions go INSIDE the tempfile.TemporaryDirectory()
+            # context manager. Outside the with-block, the temp dir (and
+            # therefore the pending file) has been torn down — pending.exists()
+            # would always return False.
+            self.assertEqual(rc, 0)  # Hook subshell stays clean.
+            # Marker should have been written to pending file.
+            self.assertTrue(pending.exists())
+            content = pending.read_text()
+            self.assertIn("[FAILURE] classifier", content)
