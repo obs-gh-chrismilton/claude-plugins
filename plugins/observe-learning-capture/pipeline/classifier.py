@@ -18,6 +18,22 @@ from pipeline.stage import _parse_yaml_list
 from pipeline.types import Candidate, ClassifierMeta, Provenance
 
 
+def _sanitize(reason: object) -> str:
+    """Return a YAML-safe ≤200-char string suitable for marker fact/excerpt fields.
+
+    Bug 3 fix: subprocess.TimeoutExpired.__str__() embeds the full argv
+    including the rendered prompt (often 30+ KB). Without sanitation, that
+    blob landed in marker YAML records and bloated the pending queue past
+    100 KB per failure. We cap at 200 chars and collapse newlines so the
+    YAML file stays bounded and human-readable.
+    """
+    s = str(reason) if not isinstance(reason, str) else reason
+    # repr() escapes control chars and embedded quotes, then strip the
+    # outer quotes that repr adds, cap, and collapse remaining newline escapes.
+    escaped = repr(s).strip("'\"")[:200].replace("\\n", " ").replace("\n", " ")
+    return escaped
+
+
 @dataclass
 class Classifier:
     """Orchestrates Haiku invocations to produce Candidate objects.
@@ -389,6 +405,11 @@ def build_marker_candidate(
     caller's contract. This marker ensures the human reviewer sees the
     failure at `/observe-review` time rather than having it silently vanish.
 
+    Bug 3 fix: failure_reason is sanitized via _sanitize() before being
+    embedded in fact/excerpt fields, capping length at 200 chars and
+    stripping newlines. Without this, subprocess.TimeoutExpired.__str__()
+    poisoned the pending YAML queue.
+
     Args:
         failure_reason: Human-readable description of what failed.
         session_id: Claude Code session identifier for provenance.
@@ -399,9 +420,10 @@ def build_marker_candidate(
         Candidate with title "[FAILURE] classifier", section "Plugin Self-Errors",
         confidence "low", and tag "self-error".
     """
+    safe_reason = _sanitize(failure_reason)
     return Candidate.create(
         title="[FAILURE] classifier",
-        fact=f"Classifier failed: {failure_reason}",
+        fact=f"Classifier failed: {safe_reason}",
         proposed_section="Plugin Self-Errors",
         confidence="low",
         tags=["self-error"],
@@ -409,7 +431,7 @@ def build_marker_candidate(
             session_id=session_id, cwd=cwd,
             captured_at=captured_at,
             # Excerpt includes the reason so reviewers don't need to check logs.
-            excerpt=f"Auto-generated marker. Reason: {failure_reason}",
+            excerpt=f"Auto-generated marker. Reason: {safe_reason}",
         ),
         classifier=None,
     )
