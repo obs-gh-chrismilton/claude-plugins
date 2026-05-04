@@ -264,7 +264,7 @@ def _auth_precheck(
         # try its own call (which has its own error handling). Don't block
         # on transient precheck failures.
         marker = build_marker_candidate(
-            failure_reason=f"precheck transient: {type(exc).__name__}",
+            failure_reason=f"[non-blocking] precheck transient: {type(exc).__name__}",
             session_id=session_id, cwd=cwd, captured_at=captured_at,
         )
         try:

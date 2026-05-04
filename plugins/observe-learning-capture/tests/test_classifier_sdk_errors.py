@@ -28,14 +28,20 @@ class TestAuthPrecheck(unittest.TestCase):
     """
 
     def setUp(self):
-        # Save and clear ANTHROPIC_API_KEY for these tests; restore in tearDown.
-        # WHY: these tests assert behavior that depends on env presence; we
-        # cannot rely on the executor's shell having (or not having) the var.
-        self._saved_key = os.environ.pop("ANTHROPIC_API_KEY", None)
+        # Use mock.patch.dict for thread/parallel-safe env isolation.
+        # WHY: raw os.environ.pop()/restore races under pytest-xdist or
+        # parallel unittest runners; mock.patch.dict snapshots the dict
+        # state and rolls back any mutations on stop().
+        self._env_patcher = mock.patch.dict(os.environ, {}, clear=False)
+        self._env_patcher.start()
+        # Now safe to mutate os.environ within the patcher's scope; the
+        # snapshot taken by patch.dict will restore on tearDown.
+        os.environ.pop("ANTHROPIC_API_KEY", None)
 
     def tearDown(self):
-        if self._saved_key is not None:
-            os.environ["ANTHROPIC_API_KEY"] = self._saved_key
+        # Restores any mutations made to os.environ during the test
+        # (including pop above and any sets inside test methods).
+        self._env_patcher.stop()
 
     def test_missing_api_key_emits_marker_and_returns_early(self):
         from pipeline import runner
