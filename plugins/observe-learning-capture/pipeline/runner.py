@@ -27,9 +27,12 @@ import argparse
 import json
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
-from pipeline.classifier import Classifier
+import anthropic
+
+from pipeline.classifier import Classifier, build_marker_candidate
 from pipeline.dedupe import extract_existing_ids, is_duplicate
 from pipeline.stage import append_candidates, read_pending
 from pipeline.transcript import last_assistant_turn, all_assistant_turns
@@ -176,6 +179,104 @@ def _load_config() -> dict:
     plugin_root = Path(__file__).parent.parent
     config_path = plugin_root / "config.json"
     return json.loads(config_path.read_text(encoding="utf-8"))
+
+
+def _auth_precheck(
+    pending_path: Path,
+    session_id: str,
+    cwd: str,
+) -> bool:
+    """Validate ANTHROPIC_API_KEY presence + correctness. Returns True if OK.
+
+    Bug 2 fix part: catches both "key unset" and "key set but invalid"
+    failure modes BEFORE any classifier work. On failure, emits a marker
+    via direct append_candidates (cannot use Classifier's marker path
+    since Classifier construction may fail too).
+
+    Per spec section 9 mantra: log AND surface — never silent.
+
+    Args:
+        pending_path: File path where any failure marker should be appended.
+        session_id: Session UUID, used for marker provenance.
+        cwd: Capture-time working directory, used for marker provenance.
+
+    Returns:
+        True if the key is present AND validates against the API; False
+        otherwise (caller should short-circuit before constructing the
+        classifier). Transient API errors at precheck time return True so
+        the classifier still gets a chance — its own error handling will
+        emit a marker if the call ultimately fails.
+    """
+    captured_at = datetime.now(timezone.utc)
+
+    # Branch 1: key not set in env at all. The hook environment may not
+    # inherit the user's shell exports, so this is a common failure mode.
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        marker = build_marker_candidate(
+            failure_reason=(
+                "ANTHROPIC_API_KEY not set in hook environment. "
+                "Add `export ANTHROPIC_API_KEY=sk-...` to ~/.zshrc and restart Claude Code."
+            ),
+            session_id=session_id, cwd=cwd, captured_at=captured_at,
+        )
+        try:
+            append_candidates(pending_path, [marker])
+        except Exception as exc:  # noqa: BLE001 — last-ditch surface to stderr
+            # If even the marker write fails, we still log so the failure is
+            # visible somewhere (stderr is captured by the hook framework).
+            print(
+                f"[observe-learning-capture] runner.py: auth-precheck marker "
+                f"write failed: {exc}",
+                file=sys.stderr,
+            )
+        print(
+            "[observe-learning-capture] runner.py: ANTHROPIC_API_KEY missing — "
+            "skipping classifier; marker emitted",
+            file=sys.stderr,
+        )
+        return False
+
+    # Branch 2: key present — validate it via models.list (free; no token
+    # consumption; stable across SDK versions). Catches the common "key
+    # rotated and stale value still in env" failure mode.
+    try:
+        client = anthropic.Anthropic()
+        client.models.list(limit=1)
+        return True
+    except anthropic.AuthenticationError as exc:
+        marker = build_marker_candidate(
+            failure_reason=f"key rejected: {getattr(exc, 'status_code', '?')} from API",
+            session_id=session_id, cwd=cwd, captured_at=captured_at,
+        )
+        try:
+            append_candidates(pending_path, [marker])
+        except Exception:  # noqa: BLE001 — best-effort marker write
+            pass
+        print(
+            f"[observe-learning-capture] runner.py: API key rejected: {exc}",
+            file=sys.stderr,
+        )
+        return False
+    except anthropic.APIError as exc:
+        # Transient connectivity / rate limit at precheck time — emit marker
+        # but ALSO return True. Reasoning: the precheck is best-effort; if
+        # the API is briefly unavailable we still want the classifier to
+        # try its own call (which has its own error handling). Don't block
+        # on transient precheck failures.
+        marker = build_marker_candidate(
+            failure_reason=f"precheck transient: {type(exc).__name__}",
+            session_id=session_id, cwd=cwd, captured_at=captured_at,
+        )
+        try:
+            append_candidates(pending_path, [marker])
+        except Exception:  # noqa: BLE001 — best-effort marker write
+            pass
+        print(
+            f"[observe-learning-capture] runner.py: precheck transient error "
+            f"(continuing anyway): {exc}",
+            file=sys.stderr,
+        )
+        return True
 
 
 if __name__ == "__main__":
