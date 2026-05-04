@@ -199,6 +199,9 @@ class Classifier:
 
         if cache_read > 0:
             # Caching IS working — heal any prior warning sentinel
+            # AND reset the miss counter so a transient cache-miss spike
+            # later requires a FRESH 5-miss window before re-warning.
+            self._cache_call_count = 0
             if self._cache_sentinel_path.exists():
                 try:
                     self._cache_sentinel_path.unlink()

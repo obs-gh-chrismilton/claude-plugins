@@ -79,3 +79,23 @@ class TestCacheWarning(unittest.TestCase):
         clf._maybe_emit_cache_warning(usage, "s", "/c", datetime.now(timezone.utc))
         self.assertFalse(self.sentinel.exists(),
                          "sentinel should be deleted on cache_read>0")
+
+    def test_counter_resets_after_cache_hit_then_requires_fresh_window(self):
+        clf = self._make_classifier()
+        miss = mock.Mock(cache_read_input_tokens=0, cache_creation_input_tokens=0)
+        hit = mock.Mock(cache_read_input_tokens=500, cache_creation_input_tokens=0)
+        # 5 misses → warning fires
+        for _ in range(5):
+            clf._maybe_emit_cache_warning(miss, "s", "/c", datetime.now(timezone.utc))
+        self.assertTrue(self.sentinel.exists())
+        # One cache hit → sentinel deleted AND counter reset to 0
+        clf._maybe_emit_cache_warning(hit, "s", "/c", datetime.now(timezone.utc))
+        self.assertFalse(self.sentinel.exists())
+        # 4 more misses should NOT re-trigger the warning (need full fresh window of 5)
+        for _ in range(4):
+            clf._maybe_emit_cache_warning(miss, "s", "/c", datetime.now(timezone.utc))
+        self.assertFalse(self.sentinel.exists(),
+                         "counter must reset on heal; 4 misses < 5-miss threshold")
+        # 5th miss in the fresh window: warning fires again
+        clf._maybe_emit_cache_warning(miss, "s", "/c", datetime.now(timezone.utc))
+        self.assertTrue(self.sentinel.exists())
