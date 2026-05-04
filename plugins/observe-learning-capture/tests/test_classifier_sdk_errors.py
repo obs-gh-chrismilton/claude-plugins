@@ -220,3 +220,154 @@ class TestSlimKnownFacts(unittest.TestCase):
         # Should return a non-empty placeholder string, not raise
         self.assertIsInstance(slim, str)
         self.assertIn("(empty", slim.lower())
+
+
+class TestSDKInvocation(unittest.TestCase):
+    """Bug 2 fix: classifier uses anthropic Python SDK, not subprocess.
+
+    The new _invoke_classifier(static, slim, user, model) returns the
+    response's first text-block content. Exception handling expanded to
+    cover the anthropic SDK exception hierarchy explicitly.
+    """
+
+    @mock.patch("anthropic.Anthropic")
+    def test_invoke_classifier_calls_sdk_with_layered_system(self, mock_client_cls):
+        from pipeline.classifier import _invoke_classifier
+
+        mock_client = mock.Mock()
+        mock_response = mock.Mock()
+        text_block = mock.Mock(type="text", text="[]")
+        mock_response.content = [text_block]
+        mock_response.usage = mock.Mock(
+            cache_read_input_tokens=0,
+            cache_creation_input_tokens=1500,
+            input_tokens=2000,
+            output_tokens=10,
+        )
+        mock_client.messages.create.return_value = mock_response
+        mock_client_cls.return_value = mock_client
+
+        result, usage = _invoke_classifier(
+            static_template="STATIC TEMPLATE TEXT",
+            slim_known_facts="SLIM FACTS",
+            user_message="USER MESSAGE",
+            model="claude-sonnet-4-5",
+        )
+
+        self.assertEqual(result, "[]")
+        # Verify Anthropic() constructor got max_retries=0
+        # (NOT messages.create() — that would TypeError; validator caught this)
+        ctor_kwargs = mock_client_cls.call_args.kwargs
+        self.assertEqual(ctor_kwargs.get("max_retries"), 0)
+        # Verify messages.create was called with the layered system blocks
+        call_kwargs = mock_client.messages.create.call_args.kwargs
+        self.assertEqual(call_kwargs["model"], "claude-sonnet-4-5")
+        # max_retries should NOT appear in create() kwargs
+        self.assertNotIn("max_retries", call_kwargs)
+        system = call_kwargs["system"]
+        self.assertEqual(len(system), 2)
+        self.assertEqual(system[0]["type"], "text")
+        self.assertEqual(system[0]["text"], "STATIC TEMPLATE TEXT")
+        self.assertEqual(system[0]["cache_control"], {"type": "ephemeral"})
+        self.assertEqual(system[1]["text"], "SLIM FACTS")
+        self.assertEqual(system[1]["cache_control"], {"type": "ephemeral"})
+        # User message in messages
+        messages = call_kwargs["messages"]
+        self.assertEqual(messages[0]["role"], "user")
+        self.assertEqual(messages[0]["content"], "USER MESSAGE")
+
+    @mock.patch("anthropic.Anthropic")
+    def test_invoke_classifier_extracts_text_defensively(self, mock_client_cls):
+        from pipeline.classifier import _invoke_classifier
+
+        # Response with thinking block first, text block second
+        mock_client = mock.Mock()
+        mock_response = mock.Mock()
+        thinking_block = mock.Mock(type="thinking")
+        text_block = mock.Mock(type="text", text="real content")
+        mock_response.content = [thinking_block, text_block]
+        mock_response.usage = mock.Mock(cache_read_input_tokens=0, cache_creation_input_tokens=0)
+        mock_client.messages.create.return_value = mock_response
+        mock_client_cls.return_value = mock_client
+
+        result, _usage = _invoke_classifier(
+            static_template="x", slim_known_facts="x",
+            user_message="x", model="claude-sonnet-4-5",
+        )
+        # Should pick the text block, not the thinking block
+        self.assertEqual(result, "real content")
+
+
+class TestClassifyExceptionHandling(unittest.TestCase):
+    """Each anthropic exception type produces exactly one marker per call;
+    failure_reason is sanitized; YAML round-trips cleanly."""
+
+    def setUp(self):
+        from pipeline.classifier import Classifier
+        self.clf = Classifier(
+            model="claude-sonnet-4-5",
+            prompt_template_path=Path(__file__).parent / "fixtures" / "test_classifier_template.md",
+            observeie_md_path=Path("/does/not/exist.md"),
+            prompt_version="test",
+        )
+        # Make sure fixture exists
+        self.clf.prompt_template_path.parent.mkdir(parents=True, exist_ok=True)
+        self.clf.prompt_template_path.write_text("static template")
+
+    def _run_with_sdk_error(self, sdk_exception):
+        with mock.patch("anthropic.Anthropic") as mock_client_cls:
+            mock_client = mock.Mock()
+            mock_client.messages.create.side_effect = sdk_exception
+            mock_client_cls.return_value = mock_client
+            return self.clf.classify(
+                turn_text="long turn text " * 20,
+                session_id="test-session",
+                cwd="/test",
+                excerpt="x",
+            )
+
+    def test_authentication_error_emits_marker(self):
+        exc = anthropic.AuthenticationError(
+            message="bad key",
+            response=mock.Mock(status_code=401),
+            body={},
+        )
+        candidates = self._run_with_sdk_error(exc)
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0].title, "[FAILURE] classifier")
+        self.assertIn("key rejected", candidates[0].fact.lower())
+
+    def test_rate_limit_error_emits_marker(self):
+        exc = anthropic.RateLimitError(
+            message="rate limited",
+            response=mock.Mock(status_code=429),
+            body={},
+        )
+        candidates = self._run_with_sdk_error(exc)
+        self.assertEqual(len(candidates), 1)
+        self.assertIn("RateLimitError", candidates[0].fact)
+
+    def test_api_timeout_error_emits_marker(self):
+        exc = anthropic.APITimeoutError(request=mock.Mock())
+        candidates = self._run_with_sdk_error(exc)
+        self.assertEqual(len(candidates), 1)
+        self.assertIn("APITimeoutError", candidates[0].fact)
+
+    def test_api_connection_error_emits_marker(self):
+        exc = anthropic.APIConnectionError(request=mock.Mock())
+        candidates = self._run_with_sdk_error(exc)
+        self.assertEqual(len(candidates), 1)
+        self.assertIn("APIConnectionError", candidates[0].fact)
+
+    def test_marker_failure_reason_is_sanitized(self):
+        # Pass a deliberately bloated exception message
+        bloated = "x" * 35000
+        exc = anthropic.APIError(
+            message=bloated,
+            request=mock.Mock(),
+            body=None,
+        )
+        candidates = self._run_with_sdk_error(exc)
+        self.assertEqual(len(candidates), 1)
+        self.assertLess(len(candidates[0].fact), 250,
+                        f"fact too long: {len(candidates[0].fact)}")

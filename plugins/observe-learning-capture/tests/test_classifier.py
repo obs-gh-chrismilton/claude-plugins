@@ -46,10 +46,21 @@ class TestClassifierParser(unittest.TestCase):
         self.assertEqual(cands, [])
 
 
+def _mock_invoke_return(text):
+    """Build a 2-tuple matching the new _invoke_classifier signature.
+
+    The classifier now returns (text, usage). Tests that don't care about
+    cache visibility just need a usage object with the cache-token attrs
+    so the (currently stub) _maybe_emit_cache_warning hook doesn't AttributeError.
+    """
+    mock_usage = mock.Mock(cache_read_input_tokens=0, cache_creation_input_tokens=0)
+    return (text, mock_usage)
+
+
 class TestClassifierEndToEnd(unittest.TestCase):
-    @mock.patch("pipeline.classifier._invoke_haiku")
+    @mock.patch("pipeline.classifier._invoke_classifier")
     def test_happy_path(self, mock_invoke):
-        mock_invoke.return_value = SAMPLE_YAML_OUTPUT
+        mock_invoke.return_value = _mock_invoke_return(SAMPLE_YAML_OUTPUT)
         with tempfile.TemporaryDirectory() as d:
             obs = Path(d) / "ObserveIE.md"
             obs.write_text("# ObserveIE\n", encoding="utf-8")
@@ -67,8 +78,10 @@ class TestClassifierEndToEnd(unittest.TestCase):
         self.assertEqual(cands[0].confidence, "high")
         self.assertEqual(cands[0].provenance.session_id, "abc")
 
-    @mock.patch("pipeline.classifier._invoke_haiku")
+    @mock.patch("pipeline.classifier._invoke_classifier")
     def test_haiku_failure_emits_marker_candidate(self, mock_invoke):
+        # RuntimeError still routes through the legacy compatibility branch
+        # (file read errors etc.) — see Classifier.classify exception ladder.
         mock_invoke.side_effect = RuntimeError("haiku timeout")
         with tempfile.TemporaryDirectory() as d:
             obs = Path(d) / "ObserveIE.md"
@@ -97,10 +110,13 @@ class TestMarkerCandidate(unittest.TestCase):
 
 
 class TestClassifierEdgeCases(unittest.TestCase):
-    @mock.patch("pipeline.classifier._invoke_haiku")
+    @mock.patch("pipeline.classifier._invoke_classifier")
     def test_subprocess_timeout_emits_marker(self, mock_invoke):
-        """Q1: subprocess.TimeoutExpired must be caught and produce a marker."""
-        mock_invoke.side_effect = subprocess.TimeoutExpired(cmd="claude", timeout=60)
+        """Bug 2 part 3 update: legacy subprocess.TimeoutExpired path is dead
+        (subprocess removed); the SDK raises anthropic.APITimeoutError instead.
+        Verify the SDK timeout path lands in the marker handler."""
+        import anthropic
+        mock_invoke.side_effect = anthropic.APITimeoutError(request=mock.Mock())
         with tempfile.TemporaryDirectory() as d:
             obs = Path(d) / "ObserveIE.md"
             obs.write_text("", encoding="utf-8")
@@ -158,10 +174,10 @@ class TestClassifierEdgeCases(unittest.TestCase):
         self.assertEqual(len(cands), 1)
         self.assertEqual(cands[0]["title"], "T")
 
-    @mock.patch("pipeline.classifier._invoke_haiku")
+    @mock.patch("pipeline.classifier._invoke_classifier")
     def test_happy_path_tags_round_trip(self, mock_invoke):
         """Q2 regression: full classify() with inline tags produces correct tag list."""
-        mock_invoke.return_value = SAMPLE_YAML_OUTPUT
+        mock_invoke.return_value = _mock_invoke_return(SAMPLE_YAML_OUTPUT)
         with tempfile.TemporaryDirectory() as d:
             obs = Path(d) / "ObserveIE.md"
             obs.write_text("", encoding="utf-8")
@@ -227,12 +243,12 @@ class TestEmptyHaikuResponse(unittest.TestCase):
         )
         self.assertFalse(_is_empty_haiku_response(response))
 
-    @mock.patch("pipeline.classifier._invoke_haiku")
+    @mock.patch("pipeline.classifier._invoke_classifier")
     def test_classify_with_fenced_empty_plus_prose_no_marker(self, mock_invoke):
         """End-to-end: a real-world dedup-style Haiku response must produce
         zero candidates, NOT a self-error marker. This is the bug T17 found.
         """
-        mock_invoke.return_value = (
+        mock_invoke.return_value = _mock_invoke_return(
             "```yaml\n"
             "[]\n"
             "```\n"

@@ -32,11 +32,17 @@ SAMPLE_HAIKU_OUTPUT = """\
 """
 
 
+def _mock_invoke_return(text):
+    """2-tuple matching the new _invoke_classifier(...) -> (text, usage) signature."""
+    mock_usage = mock.Mock(cache_read_input_tokens=0, cache_creation_input_tokens=0)
+    return (text, mock_usage)
+
+
 class TestEndToEnd(unittest.TestCase):
-    @mock.patch("pipeline.classifier._invoke_haiku")
+    @mock.patch("pipeline.classifier._invoke_classifier")
     def test_full_pipeline(self, mock_invoke):
         """Full happy path: transcript → classifier → dedupe → stage → merge."""
-        mock_invoke.return_value = SAMPLE_HAIKU_OUTPUT
+        mock_invoke.return_value = _mock_invoke_return(SAMPLE_HAIKU_OUTPUT)
         with tempfile.TemporaryDirectory() as d:
             tmp = Path(d)
             transcript = tmp / "session.jsonl"
@@ -106,10 +112,10 @@ class TestEndToEnd(unittest.TestCase):
             novel2 = [c for c in cands2 if not is_duplicate(c, existing_after)]
             self.assertEqual(novel2, [], "Same fact must not re-stage after merge")
 
-    @mock.patch("pipeline.classifier._invoke_haiku")
+    @mock.patch("pipeline.classifier._invoke_classifier")
     def test_haiku_returns_empty_no_candidates_staged(self, mock_invoke):
         """If Haiku returns [] (no candidates), pipeline silently no-ops."""
-        mock_invoke.return_value = "[]"
+        mock_invoke.return_value = _mock_invoke_return("[]")
         with tempfile.TemporaryDirectory() as d:
             tmp = Path(d)
             obs = tmp / "ObserveIE.md"
@@ -132,11 +138,15 @@ class TestEndToEnd(unittest.TestCase):
             self.assertFalse(pending.exists(),
                 "Empty candidate list should not create a pending file")
 
-    @mock.patch("pipeline.classifier._invoke_haiku")
+    @mock.patch("pipeline.classifier._invoke_classifier")
     def test_haiku_failure_emits_marker_to_pending(self, mock_invoke):
-        """Haiku timeout/failure → marker candidate staged so user sees it."""
-        import subprocess
-        mock_invoke.side_effect = subprocess.TimeoutExpired(cmd="claude", timeout=60)
+        """SDK timeout/failure → marker candidate staged so user sees it.
+
+        Bug 2 part 3 update: subprocess.TimeoutExpired is dead — the SDK
+        raises anthropic.APITimeoutError instead. This still routes through
+        the marker handler in classifier.classify."""
+        import anthropic
+        mock_invoke.side_effect = anthropic.APITimeoutError(request=mock.Mock())
         with tempfile.TemporaryDirectory() as d:
             tmp = Path(d)
             obs = tmp / "ObserveIE.md"

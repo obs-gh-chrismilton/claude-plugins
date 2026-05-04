@@ -14,6 +14,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, List, Optional
 
+import anthropic
+
 from pipeline.stage import _parse_yaml_list
 from pipeline.types import Candidate, ClassifierMeta, Provenance
 
@@ -59,85 +61,77 @@ class Classifier:
         cwd: str,
         excerpt: Optional[str] = None,
     ) -> List[Candidate]:
-        """Run Haiku on turn_text. Returns 0+ candidates.
+        """Run classifier on turn_text. Returns 0+ candidates.
 
-        On Haiku failure, returns a single marker candidate (per spec §9).
-        Errors logged to stderr before marker emission for visibility.
+        Bug 2 fix: SDK-based, layered cacheable prompt.
+        Bug 5 fix: per-record errors emit markers, not silent skips.
 
-        Args:
-            turn_text: Full conversation turn text to analyze.
-            session_id: Claude Code session identifier for provenance.
-            cwd: Working directory at capture time (identifies customer context).
-            excerpt: Optional short excerpt; defaults to first 200 chars of turn_text.
-
-        Returns:
-            List of Candidate objects (possibly empty). On Haiku failure,
-            returns a single marker Candidate with tag "self-error".
+        On any classifier failure, emit a marker (per spec §9). Errors
+        logged to stderr before marker emission for visibility.
         """
         captured_at = datetime.now(timezone.utc)
-        # Default excerpt: first 200 chars of the turn — enough to identify
-        # context during review without bloating the staging YAML.
         excerpt = excerpt or turn_text[:200]
 
         try:
-            # Bug 2 part 2 interim: _build_prompt now returns a 3-tuple
-            # (static_template, slim_known_facts, user_message) for the
-            # forthcoming SDK rewrite (Task 8) which will pass each part
-            # to its own cache-controlled block. Until the SDK rewrite
-            # lands, _invoke_haiku still expects a single rendered prompt
-            # string, so we re-join the parts here. Task 8 deletes this
-            # shim and replaces _invoke_haiku with an SDK call that
-            # consumes the tuple directly.
             slim_known_facts = _generate_slim_known_facts(self.observeie_md_path)
-            static, slim, user_msg = _build_prompt(
+            static_template, slim_block, user_message = _build_prompt(
                 template_path=self.prompt_template_path,
                 turn_text=turn_text,
                 slim_known_facts=slim_known_facts,
                 cwd=cwd,
                 captured_at=captured_at,
             )
-            prompt = f"{static}\n\n{slim}\n\n{user_msg}"
-            haiku_output = _invoke_haiku(prompt, self.model)
-        except (RuntimeError, OSError, subprocess.SubprocessError) as e:
-            # Q1 fix: subprocess.TimeoutExpired inherits from subprocess.SubprocessError,
-            # NOT from RuntimeError or OSError. Without this third clause a 60-second
-            # Haiku hang would escape the handler and crash the SessionStop hook.
-            # Catching subprocess.SubprocessError covers TimeoutExpired,
-            # CalledProcessError, and any future subprocess exceptions cleanly.
-            # WHY: spec §9 — log AND surface. Never silent.
+            classifier_output, usage = _invoke_classifier(
+                static_template=static_template,
+                slim_known_facts=slim_block,
+                user_message=user_message,
+                model=self.model,
+            )
+            # Cache visibility check — surface a marker if cache silently no-ops.
+            self._maybe_emit_cache_warning(usage, session_id, cwd, captured_at)
+        except anthropic.AuthenticationError as exc:
             print(
-                f"[observe-learning-capture] classifier.py: haiku invocation "
-                f"failed for session={session_id}: {e}",
+                f"[observe-learning-capture] classifier.py: API key rejected "
+                f"for session={session_id}: {exc}",
                 file=sys.stderr,
             )
-            return [
-                build_marker_candidate(
-                    failure_reason=str(e),
-                    session_id=session_id, cwd=cwd,
-                    captured_at=captured_at,
-                )
-            ]
+            return [build_marker_candidate(
+                failure_reason=f"key rejected: {getattr(exc, 'status_code', '?')} from API",
+                session_id=session_id, cwd=cwd, captured_at=captured_at,
+            )]
+        except anthropic.APIError as exc:
+            print(
+                f"[observe-learning-capture] classifier.py: SDK error "
+                f"for session={session_id}: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            return [build_marker_candidate(
+                failure_reason=f"{type(exc).__name__}: {exc}",
+                session_id=session_id, cwd=cwd, captured_at=captured_at,
+            )]
+        except (RuntimeError, OSError) as exc:
+            # Legacy compatibility — file read errors etc.
+            print(
+                f"[observe-learning-capture] classifier.py: classifier failed "
+                f"for session={session_id}: {exc}",
+                file=sys.stderr,
+            )
+            return [build_marker_candidate(
+                failure_reason=str(exc),
+                session_id=session_id, cwd=cwd, captured_at=captured_at,
+            )]
 
-        raw_candidates = parse_haiku_yaml_output(haiku_output)
-        if not raw_candidates and not _is_empty_haiku_response(haiku_output):
-            # Haiku returned something the parser couldn't parse —
-            # non-empty/non-empty-list (after fence stripping), but no candidates extracted.
-            # Log the first 200 chars for diagnostics; surface a marker.
-            # WHY use _is_empty_haiku_response: Haiku may wrap "[]" in ```yaml fences.
-            # haiku_output.strip() != "[]" would fire spuriously on "```yaml\n[]\n```".
-            # The helper normalises both fenced and bare empty-list responses.
+        raw_candidates = parse_haiku_yaml_output(classifier_output)
+        if not raw_candidates and not _is_empty_haiku_response(classifier_output):
             print(
                 f"[observe-learning-capture] classifier.py: malformed yaml "
-                f"from haiku for session={session_id}",
+                f"from classifier for session={session_id}",
                 file=sys.stderr,
             )
-            return [
-                build_marker_candidate(
-                    failure_reason=f"malformed yaml: {haiku_output[:200]}",
-                    session_id=session_id, cwd=cwd,
-                    captured_at=captured_at,
-                )
-            ]
+            return [build_marker_candidate(
+                failure_reason=f"malformed yaml: {classifier_output[:200]}",
+                session_id=session_id, cwd=cwd, captured_at=captured_at,
+            )]
 
         result: List[Candidate] = []
         for raw in raw_candidates:
@@ -164,6 +158,10 @@ class Classifier:
                 ))
                 continue
         return result
+
+    def _maybe_emit_cache_warning(self, usage, session_id, cwd, captured_at):
+        """Stub for Task 9 cache visibility — implemented next."""
+        pass
 
 
 def parse_haiku_yaml_output(output: str) -> List[dict[str, Any]]:
@@ -379,6 +377,62 @@ def _generate_slim_known_facts(observeie_md_path: Path) -> str:
         else:
             parts.append("  Known ids: (none)")
     return "\n".join(parts)
+
+
+def _invoke_classifier(
+    static_template: str,
+    slim_known_facts: str,
+    user_message: str,
+    model: str,
+) -> tuple[str, object]:
+    """Call the Anthropic SDK with layered cacheable system blocks.
+
+    Returns (text_output, usage) where text_output is the first text block
+    of the response and usage is the response.usage object (for cache
+    visibility in callers).
+
+    Bug 2 fix: replaces subprocess.run(['claude','--print',prompt],...).
+    Eliminates: recursive Claude-Code-from-inside-Claude-Code invocation,
+    60s subprocess ceiling, full ObserveIE.md re-processed every call.
+
+    max_retries=0 so we own the retry budget; SDK's default 2 retries
+    with exponential backoff would otherwise compound with timeout=120
+    to ~6 min worst-case wall time (hook subshell may be reaped first).
+
+    cache_control: ephemeral on both system blocks. Sonnet 4.5's 1024-token
+    cache minimum lets the slim payload (~1KB) actually cache, unlike
+    Haiku 4.5's 4096-token min which would silently no-op.
+
+    NOTE: max_retries is an Anthropic() constructor arg, NOT a
+    messages.create() kwarg. Validator caught this during plan review —
+    passing max_retries to create() raises TypeError on first call.
+    """
+    # max_retries=0 on the client (constructor) — NOT on messages.create()
+    client = anthropic.Anthropic(max_retries=0)  # auto-loads ANTHROPIC_API_KEY
+    response = client.messages.create(
+        model=model,
+        max_tokens=2048,
+        system=[
+            {
+                "type": "text",
+                "text": static_template,
+                "cache_control": {"type": "ephemeral"},
+            },
+            {
+                "type": "text",
+                "text": slim_known_facts,
+                "cache_control": {"type": "ephemeral"},
+            },
+        ],
+        messages=[{"role": "user", "content": user_message}],
+        timeout=120,
+    )
+    # Defensive content extraction — handles thinking blocks, multi-block responses
+    text_output = next(
+        (b.text for b in response.content if getattr(b, "type", None) == "text"),
+        "",
+    )
+    return text_output, response.usage
 
 
 def _invoke_haiku(prompt: str, model: str) -> str:
