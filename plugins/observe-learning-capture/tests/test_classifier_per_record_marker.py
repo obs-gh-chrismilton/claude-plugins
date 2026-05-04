@@ -45,7 +45,11 @@ class TestPerRecordMarker(unittest.TestCase):
   confidence: high
   tags: [opal]
 """
-        _build.return_value = "irrelevant prompt"
+        # Bug 2 part 2: _build_prompt now returns a 3-tuple
+        # (static_template, slim_known_facts, user_message). The test
+        # only cares that classify reaches _invoke_haiku — the prompt
+        # content itself is irrelevant because _invoke_haiku is mocked.
+        _build.return_value = ("static", "slim", "user")
 
         candidates = self.clf.classify(
             turn_text="some turn text " * 20,
@@ -72,7 +76,8 @@ class TestPerRecordMarker(unittest.TestCase):
   proposed_section: "OPAL Gotchas"
   confidence: high
 """
-        _build.return_value = "irrelevant"
+        # Bug 2 part 2: _build_prompt now returns a 3-tuple.
+        _build.return_value = ("static", "slim", "user")
 
         candidates = self.clf.classify(
             turn_text="some turn text " * 20,

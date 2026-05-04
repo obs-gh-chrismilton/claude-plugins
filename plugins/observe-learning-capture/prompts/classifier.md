@@ -71,18 +71,22 @@ own line.
 
 ---
 
-# Already known (in ObserveIE.md, do NOT re-capture)
+# Already known facts (do not re-capture)
 
-{{ALREADY_KNOWN}}
+The user will provide a slim list of section headers and dedup-key id hashes
+already captured. Treat any candidate whose normalized fact would produce
+an id already in that list as a duplicate — do not propose it.
 
 ---
 
-# Conversation excerpt to analyze
+# Turn under review
 
-Captured at: {{CONTEXT_TIMESTAMP}}
-Working directory: {{CWD}}
+The user message will provide:
+- The conversation turn text to analyze
+- Working directory at capture time (identifies customer context)
+- Capture timestamp
 
-{{TURN}}
+Analyze the turn and emit candidates per the schema below.
 
 ---
 

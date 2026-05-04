@@ -80,14 +80,23 @@ class Classifier:
         excerpt = excerpt or turn_text[:200]
 
         try:
-            already_known = _read_safe(self.observeie_md_path)
-            prompt = _build_prompt(
+            # Bug 2 part 2 interim: _build_prompt now returns a 3-tuple
+            # (static_template, slim_known_facts, user_message) for the
+            # forthcoming SDK rewrite (Task 8) which will pass each part
+            # to its own cache-controlled block. Until the SDK rewrite
+            # lands, _invoke_haiku still expects a single rendered prompt
+            # string, so we re-join the parts here. Task 8 deletes this
+            # shim and replaces _invoke_haiku with an SDK call that
+            # consumes the tuple directly.
+            slim_known_facts = _generate_slim_known_facts(self.observeie_md_path)
+            static, slim, user_msg = _build_prompt(
                 template_path=self.prompt_template_path,
                 turn_text=turn_text,
-                already_known=already_known,
+                slim_known_facts=slim_known_facts,
                 cwd=cwd,
                 captured_at=captured_at,
             )
+            prompt = f"{static}\n\n{slim}\n\n{user_msg}"
             haiku_output = _invoke_haiku(prompt, self.model)
         except (RuntimeError, OSError, subprocess.SubprocessError) as e:
             # Q1 fix: subprocess.TimeoutExpired inherits from subprocess.SubprocessError,
@@ -276,30 +285,100 @@ def _is_empty_haiku_response(raw_output: str) -> bool:
 def _build_prompt(
     template_path: Path,
     turn_text: str,
-    already_known: str,
+    slim_known_facts: str,
     cwd: str,
     captured_at: datetime,
-) -> str:
-    """Render the classifier prompt by substituting template placeholders.
-
-    Args:
-        template_path: Path to classifier.md prompt template.
-        turn_text: Conversation text to analyze.
-        already_known: Full content of ObserveIE.md (prevents re-capture).
-        cwd: Working directory at capture time.
-        captured_at: UTC timestamp for context.
+) -> tuple[str, str, str]:
+    """Render the classifier prompt as a 3-tuple for layered cache structure.
 
     Returns:
-        Fully rendered prompt string, ready to pass to the `claude` CLI.
+        (static_template, slim_known_facts, user_message)
+
+    The static template (cached system block 1) contains pure instruction
+    content with no per-call placeholders. slim_known_facts (cached system
+    block 2) is the bounded section-headers + id-list summary of
+    ObserveIE.md. user_message wraps the per-call turn / cwd / timestamp.
+
+    Bug 2 fix: previous version inlined ALREADY_KNOWN (30 KB ObserveIE.md)
+    plus per-call values into one rendered string, which both bloated the
+    prompt and (with the SDK rewrite) would have invalidated cache on
+    every call due to per-call placeholders.
     """
     template = template_path.read_text(encoding="utf-8")
-    return (
-        template
-        .replace("{{TURN}}", turn_text)
-        .replace("{{ALREADY_KNOWN}}", already_known or "(empty)")
-        .replace("{{CWD}}", cwd)
-        .replace("{{CONTEXT_TIMESTAMP}}", captured_at.isoformat())
+    user_message = (
+        f"<turn>\n{turn_text}\n</turn>\n"
+        f"<cwd>{cwd}</cwd>\n"
+        f"<context_timestamp>{captured_at.isoformat()}</context_timestamp>"
     )
+    return template, slim_known_facts, user_message
+
+
+# Tolerant regex for ObserveIE.md dedup-key id markers.
+# Real ObserveIE.md format is: `<!-- id:c4f9d2a1 captured:2026-05-01 ... -->`
+# i.e. no space after `id:`, the 8-char hash is followed by ` captured:...`
+# rather than `-->`. The regex accepts:
+#   <!-- id:abcd1234 -->
+#   <!-- id: abcd1234 -->
+#   <!-- id:abcd1234 captured:2026-05-01 -->
+#   <!--id:abcd1234-->
+# Verified against /Users/chmilton/.claude/agents/ObserveIE.md format
+# during validator review (executor agent confirmed real format).
+_OBSERVEIE_ID_RE = re.compile(r"<!--\s*id:\s*([0-9a-f]{6,16})\b")
+
+
+def _generate_slim_known_facts(observeie_md_path: Path) -> str:
+    """Render a bounded slim summary of ObserveIE.md for the cached prompt block.
+
+    Format:
+        Section: <name>
+          Known ids: id1, id2, id3
+        Section: <name>
+          Known ids: ...
+
+    Bounded to id list (no body text) so the slim block stays sub-2KB
+    regardless of ObserveIE.md growth. The deterministic post-classify
+    dedupe in runner.py is the actual correctness gate; Haiku/Sonnet just
+    needs section + id awareness to avoid obvious recapture attempts.
+
+    On read failure, returns "(empty — ObserveIE.md unreadable)" so the
+    classifier still runs (with no known-facts context) rather than
+    crashing the pipeline.
+    """
+    if not observeie_md_path.exists():
+        return "(empty — ObserveIE.md does not exist yet)"
+    try:
+        text = observeie_md_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        print(
+            f"[observe-learning-capture] classifier.py: cannot read "
+            f"ObserveIE.md for slim known-facts: {exc}",
+            file=sys.stderr,
+        )
+        return "(empty — ObserveIE.md unreadable)"
+
+    # Walk the file, tracking current section header and collecting ids.
+    sections: dict[str, list[str]] = {}
+    current_section: Optional[str] = None
+    for line in text.splitlines():
+        if line.startswith("## "):
+            current_section = line[3:].strip()
+            sections.setdefault(current_section, [])
+        elif current_section is not None:
+            m = _OBSERVEIE_ID_RE.search(line)
+            if m:
+                sections[current_section].append(m.group(1))
+
+    if not sections:
+        return "(empty — no sections found in ObserveIE.md)"
+
+    parts = []
+    for section, ids in sections.items():
+        parts.append(f"Section: {section}")
+        if ids:
+            parts.append(f"  Known ids: {', '.join(ids)}")
+        else:
+            parts.append("  Known ids: (none)")
+    return "\n".join(parts)
 
 
 def _invoke_haiku(prompt: str, model: str) -> str:
