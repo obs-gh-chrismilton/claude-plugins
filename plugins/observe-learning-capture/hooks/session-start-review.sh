@@ -2,11 +2,16 @@
 # session-start-review.sh — SessionStart hook for observe-learning-capture.
 #
 # At every session start, if the pending file has any candidates, emit a
-# system-reminder block on stdout. Claude Code will inject this into the
-# agent's context — Claude reads it and surfaces the candidates to the
-# user on first prompt (per CLAUDE.md companion rule from T15).
+# review block on stdout. Claude Code injects stdout into the agent's
+# context — Claude reads it and surfaces the candidates to the user
+# on first prompt (per CLAUDE.md companion rule).
 #
-# Output goes to stdout; logs to file. Always exit 0.
+# Bug 4 fix: previous version used inline `python3 -c '...'` with
+# sys.path.insert from `os.environ.get("PWD")` — fragile when PWD
+# wasn't exported. Now calls the proper pipeline.render_pending module
+# via `python3 -m`.
+#
+# Output: stdout. Logs to file. Always exit 0.
 #
 # Debug env:
 #   PENDING_FILE_OVERRIDE — override default pending file path (for tests).
@@ -34,38 +39,13 @@ fi
 
 log "pending file present — emitting review context"
 
-# Render compact summary by parsing the YAML pending file via Python.
-cd "$PLUGIN_ROOT"
-PENDING_FILE="$PENDING_FILE" python3 -c '
-import os, sys
-from pathlib import Path
-plugin_root = os.environ.get("PWD", ".")
-sys.path.insert(0, plugin_root)
-from pipeline.stage import read_pending
-
-pending_path = Path(os.environ["PENDING_FILE"])
-records = read_pending(pending_path)
-if not records:
-    sys.exit(0)
-
-print("=== OBSERVE LEARNING CAPTURE — PENDING REVIEW ===")
-print(f"{len(records)} candidate(s) pending review from prior sessions:")
-print()
-for i, r in enumerate(records, 1):
-    conf = r.get("confidence", "?")
-    section = r.get("proposed_section", "?")
-    title = r.get("title", "(no title)")
-    src = r.get("source", {})
-    cwd = src.get("cwd", "?")
-    cwd_short = cwd.replace(os.path.expanduser("~"), "~")
-    captured_at = src.get("captured_at", "?")[:10]
-    print(f"  #{i} [{conf:6}] {section}: {title}")
-    print(f"       (from {cwd_short}, {captured_at})")
-print()
-print("I should surface these candidates to the user before responding to")
-print("their first prompt. The user may reply: merge all / merge N /")
-print("discard N / edit N / defer.")
-print("=== END OBSERVE LEARNING CAPTURE ===")
-' 2>>"$LOG_FILE" || log "review render failed"
+# Bug 4 fix: invoke the dedicated render module.
+# - cd to plugin root so `python3 -m pipeline.render_pending` resolves the package.
+# - PYTHONPATH belt-and-suspenders in case the cd is insufficient under unusual shells.
+# - PENDING_FILE_OVERRIDE forwarded so tests can point the renderer at a fixture.
+cd "$PLUGIN_ROOT" || { log "cd $PLUGIN_ROOT failed"; exit 0; }
+PYTHONPATH="$PLUGIN_ROOT" PENDING_FILE_OVERRIDE="$PENDING_FILE" \
+    python3 -m pipeline.render_pending 2>>"$LOG_FILE" \
+    || log "render_pending invocation failed"
 
 exit 0

@@ -1,0 +1,1 @@
+Static instruction text without placeholders.

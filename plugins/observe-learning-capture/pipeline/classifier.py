@@ -1,40 +1,74 @@
-"""Haiku-based classifier for learning candidates.
+"""Classifier for learning candidates.
 
-Invokes the `claude` CLI as a subprocess (no API key handling here — the
-CLI manages auth). On any failure, emits a "marker candidate" so the
-human sees the failure at next review (per spec §9 — log AND surface).
+Invokes the Anthropic SDK directly (auth via ANTHROPIC_API_KEY in env).
+On any failure, emits a "marker candidate" so the human sees the failure
+at next review (per spec §9 — log AND surface).
 """
 from __future__ import annotations
 
+import os
 import re
-import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, List, Optional
+
+import anthropic
 
 from pipeline.stage import _parse_yaml_list
 from pipeline.types import Candidate, ClassifierMeta, Provenance
 
 
+def _sanitize(reason: object) -> str:
+    """Return a YAML-safe ≤200-char string suitable for marker fact/excerpt fields.
+
+    Bug 3 fix: subprocess.TimeoutExpired.__str__() embeds the full argv
+    including the rendered prompt (often 30+ KB). Without sanitation, that
+    blob landed in marker YAML records and bloated the pending queue past
+    100 KB per failure. We cap at 200 chars and collapse newlines so the
+    YAML file stays bounded and human-readable.
+    """
+    s = str(reason) if not isinstance(reason, str) else reason
+    # repr() escapes control chars and embedded quotes, then strip the
+    # outer quotes that repr adds, cap, and collapse remaining newline escapes.
+    escaped = repr(s).strip("'\"")[:200].replace("\\n", " ").replace("\n", " ")
+    return escaped
+
+
 @dataclass
 class Classifier:
-    """Orchestrates Haiku invocations to produce Candidate objects.
+    """Orchestrates Anthropic SDK invocations to produce Candidate objects.
 
     Attributes:
-        model: Claude model ID string (e.g. "claude-haiku-4-5-20251001").
-        prompt_template_path: Path to the classifier.md prompt template.
-        observeie_md_path: Path to ObserveIE.md — already-known content
-            injected into the prompt so Haiku avoids re-capturing known facts.
+        model: Claude model ID (e.g. "claude-sonnet-4-5").
+        prompt_template_path: Path to the static classifier prompt template.
+        observeie_md_path: Path to ObserveIE.md — slim known-facts derived
+            from this so Haiku/Sonnet avoids re-capturing known facts.
         prompt_version: Version label embedded in ClassifierMeta for each
             produced candidate, so prompts can be retro-evaluated later.
+        pending_path: Where marker candidates are appended on failure.
+            Injected (NOT hardcoded) so tests use a tmp path and never
+            pollute the user's real ~/.claude/agents/.observeie-pending.md.
+        _cache_call_count: Counter of consecutive calls observed with
+            cache_read_input_tokens == 0. Reset on first cache hit.
+        _cache_sentinel_path: One-shot marker file. When present, the
+            cache-disabled warning has already been emitted and we skip
+            re-emission. Deleted on first observed cache hit so the
+            warning re-fires if the situation regresses.
     """
 
     model: str
     prompt_template_path: Path
     observeie_md_path: Path
     prompt_version: str = "1.0"
+    pending_path: Path = field(default_factory=lambda: Path(
+        os.path.expanduser("~/.claude/agents/.observeie-pending.md")
+    ))
+    _cache_call_count: int = 0
+    _cache_sentinel_path: Path = field(default_factory=lambda: Path(
+        os.path.expanduser("~/.claude/agents/.observe-cache-warned")
+    ))
 
     def classify(
         self,
@@ -43,76 +77,77 @@ class Classifier:
         cwd: str,
         excerpt: Optional[str] = None,
     ) -> List[Candidate]:
-        """Run Haiku on turn_text. Returns 0+ candidates.
+        """Run classifier on turn_text. Returns 0+ candidates.
 
-        On Haiku failure, returns a single marker candidate (per spec §9).
-        Errors logged to stderr before marker emission for visibility.
+        Bug 2 fix: SDK-based, layered cacheable prompt.
+        Bug 5 fix: per-record errors emit markers, not silent skips.
 
-        Args:
-            turn_text: Full conversation turn text to analyze.
-            session_id: Claude Code session identifier for provenance.
-            cwd: Working directory at capture time (identifies customer context).
-            excerpt: Optional short excerpt; defaults to first 200 chars of turn_text.
-
-        Returns:
-            List of Candidate objects (possibly empty). On Haiku failure,
-            returns a single marker Candidate with tag "self-error".
+        On any classifier failure, emit a marker (per spec §9). Errors
+        logged to stderr before marker emission for visibility.
         """
         captured_at = datetime.now(timezone.utc)
-        # Default excerpt: first 200 chars of the turn — enough to identify
-        # context during review without bloating the staging YAML.
         excerpt = excerpt or turn_text[:200]
 
         try:
-            already_known = _read_safe(self.observeie_md_path)
-            prompt = _build_prompt(
+            slim_known_facts = _generate_slim_known_facts(self.observeie_md_path)
+            static_template, slim_block, user_message = _build_prompt(
                 template_path=self.prompt_template_path,
                 turn_text=turn_text,
-                already_known=already_known,
+                slim_known_facts=slim_known_facts,
                 cwd=cwd,
                 captured_at=captured_at,
             )
-            haiku_output = _invoke_haiku(prompt, self.model)
-        except (RuntimeError, OSError, subprocess.SubprocessError) as e:
-            # Q1 fix: subprocess.TimeoutExpired inherits from subprocess.SubprocessError,
-            # NOT from RuntimeError or OSError. Without this third clause a 60-second
-            # Haiku hang would escape the handler and crash the SessionStop hook.
-            # Catching subprocess.SubprocessError covers TimeoutExpired,
-            # CalledProcessError, and any future subprocess exceptions cleanly.
-            # WHY: spec §9 — log AND surface. Never silent.
+            classifier_output, usage = _invoke_classifier(
+                static_template=static_template,
+                slim_known_facts=slim_block,
+                user_message=user_message,
+                model=self.model,
+            )
+            # Cache visibility check — surface a marker if cache silently no-ops.
+            self._maybe_emit_cache_warning(usage, session_id, cwd, captured_at)
+        except anthropic.AuthenticationError as exc:
             print(
-                f"[observe-learning-capture] classifier.py: haiku invocation "
-                f"failed for session={session_id}: {e}",
+                f"[observe-learning-capture] classifier.py: API key rejected "
+                f"for session={session_id}: {exc}",
                 file=sys.stderr,
             )
-            return [
-                build_marker_candidate(
-                    failure_reason=str(e),
-                    session_id=session_id, cwd=cwd,
-                    captured_at=captured_at,
-                )
-            ]
+            return [build_marker_candidate(
+                failure_reason=f"key rejected: {getattr(exc, 'status_code', '?')} from API",
+                session_id=session_id, cwd=cwd, captured_at=captured_at,
+            )]
+        except anthropic.APIError as exc:
+            print(
+                f"[observe-learning-capture] classifier.py: SDK error "
+                f"for session={session_id}: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            return [build_marker_candidate(
+                failure_reason=f"{type(exc).__name__}: {exc}",
+                session_id=session_id, cwd=cwd, captured_at=captured_at,
+            )]
+        except (RuntimeError, OSError) as exc:
+            # Legacy compatibility — file read errors etc.
+            print(
+                f"[observe-learning-capture] classifier.py: classifier failed "
+                f"for session={session_id}: {exc}",
+                file=sys.stderr,
+            )
+            return [build_marker_candidate(
+                failure_reason=str(exc),
+                session_id=session_id, cwd=cwd, captured_at=captured_at,
+            )]
 
-        raw_candidates = parse_haiku_yaml_output(haiku_output)
-        if not raw_candidates and not _is_empty_haiku_response(haiku_output):
-            # Haiku returned something the parser couldn't parse —
-            # non-empty/non-empty-list (after fence stripping), but no candidates extracted.
-            # Log the first 200 chars for diagnostics; surface a marker.
-            # WHY use _is_empty_haiku_response: Haiku may wrap "[]" in ```yaml fences.
-            # haiku_output.strip() != "[]" would fire spuriously on "```yaml\n[]\n```".
-            # The helper normalises both fenced and bare empty-list responses.
+        raw_candidates = parse_haiku_yaml_output(classifier_output)
+        if not raw_candidates and not _is_empty_haiku_response(classifier_output):
             print(
                 f"[observe-learning-capture] classifier.py: malformed yaml "
-                f"from haiku for session={session_id}",
+                f"from classifier for session={session_id}",
                 file=sys.stderr,
             )
-            return [
-                build_marker_candidate(
-                    failure_reason=f"malformed yaml: {haiku_output[:200]}",
-                    session_id=session_id, cwd=cwd,
-                    captured_at=captured_at,
-                )
-            ]
+            return [build_marker_candidate(
+                failure_reason=f"malformed yaml: {classifier_output[:200]}",
+                session_id=session_id, cwd=cwd, captured_at=captured_at,
+            )]
 
         result: List[Candidate] = []
         for raw in raw_candidates:
@@ -123,16 +158,86 @@ class Classifier:
                     model=self.model, prompt_version=self.prompt_version,
                 ))
             except (KeyError, ValueError) as e:
-                # Skip malformed individual records but log so nothing is
-                # silently dropped. WHY: one bad record shouldn't block
-                # the rest of the batch.
+                # Bug 5 fix: emit a marker per malformed record so failures
+                # surface at /observe-review time. Previous behavior silently
+                # dropped the record (logged to stderr only). One bad record
+                # still doesn't block the rest of the batch.
                 print(
-                    f"[observe-learning-capture] classifier.py: skipped "
-                    f"malformed candidate record: {e}",
+                    f"[observe-learning-capture] classifier.py: malformed "
+                    f"candidate record: {e}",
                     file=sys.stderr,
                 )
+                result.append(build_marker_candidate(
+                    failure_reason=f"malformed candidate record: missing field {e}",
+                    session_id=session_id, cwd=cwd,
+                    captured_at=captured_at,
+                ))
                 continue
         return result
+
+    def _maybe_emit_cache_warning(
+        self,
+        usage,
+        session_id: str,
+        cwd: str,
+        captured_at: datetime,
+    ) -> None:
+        """Surface a marker if prompt cache silently no-ops.
+
+        Per silent-failure-hunter review: if our prompt is below the model's
+        cache minimum (1024 tokens for Sonnet 4.5), cache_control markers
+        silently no-op — cache_creation_input_tokens=0, no error raised.
+        Classifier "succeeds" but pays full input cost forever with no signal.
+
+        Strategy: after 5 calls with cache_read_input_tokens consistently 0,
+        emit a one-shot marker via sentinel file. Self-healing: sentinel is
+        deleted on first observed cache_read>0 so the warning re-fires if
+        the situation regresses.
+        """
+        cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
+
+        if cache_read > 0:
+            # Caching IS working — heal any prior warning sentinel
+            # AND reset the miss counter so a transient cache-miss spike
+            # later requires a FRESH 5-miss window before re-warning.
+            self._cache_call_count = 0
+            if self._cache_sentinel_path.exists():
+                try:
+                    self._cache_sentinel_path.unlink()
+                except OSError:
+                    pass  # best-effort heal
+            return
+
+        # Cache not hitting on this call
+        self._cache_call_count += 1
+        if self._cache_call_count < 5:
+            return  # not enough evidence yet
+
+        if self._cache_sentinel_path.exists():
+            return  # already warned; don't spam
+
+        # Emit one-shot marker — uses injected pending_path, NOT hardcoded
+        # (validator caught the hardcoded path was polluting tests' real
+        # pending file and was an architectural violation).
+        from pipeline.stage import append_candidates
+        pending_path = self.pending_path
+        marker = build_marker_candidate(
+            failure_reason=(
+                f"cache disabled: prefix below threshold "
+                f"({self._cache_call_count} calls × 0 cache reads)"
+            ),
+            session_id=session_id, cwd=cwd, captured_at=captured_at,
+        )
+        try:
+            append_candidates(pending_path, [marker])
+            self._cache_sentinel_path.parent.mkdir(parents=True, exist_ok=True)
+            self._cache_sentinel_path.touch()
+        except Exception as exc:
+            print(
+                f"[observe-learning-capture] classifier.py: cache-warning "
+                f"emission failed: {exc}",
+                file=sys.stderr,
+            )
 
 
 def parse_haiku_yaml_output(output: str) -> List[dict[str, Any]]:
@@ -254,86 +359,156 @@ def _is_empty_haiku_response(raw_output: str) -> bool:
 def _build_prompt(
     template_path: Path,
     turn_text: str,
-    already_known: str,
+    slim_known_facts: str,
     cwd: str,
     captured_at: datetime,
-) -> str:
-    """Render the classifier prompt by substituting template placeholders.
-
-    Args:
-        template_path: Path to classifier.md prompt template.
-        turn_text: Conversation text to analyze.
-        already_known: Full content of ObserveIE.md (prevents re-capture).
-        cwd: Working directory at capture time.
-        captured_at: UTC timestamp for context.
+) -> tuple[str, str, str]:
+    """Render the classifier prompt as a 3-tuple for layered cache structure.
 
     Returns:
-        Fully rendered prompt string, ready to pass to the `claude` CLI.
+        (static_template, slim_known_facts, user_message)
+
+    The static template (cached system block 1) contains pure instruction
+    content with no per-call placeholders. slim_known_facts (cached system
+    block 2) is the bounded section-headers + id-list summary of
+    ObserveIE.md. user_message wraps the per-call turn / cwd / timestamp.
+
+    Bug 2 fix: previous version inlined ALREADY_KNOWN (30 KB ObserveIE.md)
+    plus per-call values into one rendered string, which both bloated the
+    prompt and (with the SDK rewrite) would have invalidated cache on
+    every call due to per-call placeholders.
     """
     template = template_path.read_text(encoding="utf-8")
-    return (
-        template
-        .replace("{{TURN}}", turn_text)
-        .replace("{{ALREADY_KNOWN}}", already_known or "(empty)")
-        .replace("{{CWD}}", cwd)
-        .replace("{{CONTEXT_TIMESTAMP}}", captured_at.isoformat())
+    user_message = (
+        f"<turn>\n{turn_text}\n</turn>\n"
+        f"<cwd>{cwd}</cwd>\n"
+        f"<context_timestamp>{captured_at.isoformat()}</context_timestamp>"
     )
+    return template, slim_known_facts, user_message
 
 
-def _invoke_haiku(prompt: str, model: str) -> str:
-    """Call the `claude` CLI with --model and --print. Returns stdout.
+# Tolerant regex for ObserveIE.md dedup-key id markers.
+# Real ObserveIE.md format is: `<!-- id:c4f9d2a1 captured:2026-05-01 ... -->`
+# i.e. no space after `id:`, the 8-char hash is followed by ` captured:...`
+# rather than `-->`. The regex accepts:
+#   <!-- id:abcd1234 -->
+#   <!-- id: abcd1234 -->
+#   <!-- id:abcd1234 captured:2026-05-01 -->
+#   <!--id:abcd1234-->
+# Verified against /Users/chmilton/.claude/agents/ObserveIE.md format
+# during validator review (executor agent confirmed real format).
+_OBSERVEIE_ID_RE = re.compile(r"<!--\s*id:\s*([0-9a-f]{6,16})\b")
 
-    Uses subprocess (not the SDK) so the CLI handles auth — no API key
-    management needed here. Timeout is 60 seconds to avoid blocking the
-    SessionStop hook indefinitely.
 
-    Args:
-        prompt: Fully rendered prompt string to pass as the last argument.
-        model: Claude model ID string (e.g. "claude-haiku-4-5-20251001").
+def _generate_slim_known_facts(observeie_md_path: Path) -> str:
+    """Render a bounded slim summary of ObserveIE.md for the cached prompt block.
 
-    Returns:
-        stdout text from the `claude` CLI.
+    Format:
+        Section: <name>
+          Known ids: id1, id2, id3
+        Section: <name>
+          Known ids: ...
 
-    Raises:
-        RuntimeError: If the subprocess exits with a non-zero return code.
-        OSError: If the subprocess cannot be started (e.g., `claude` not found).
-        subprocess.TimeoutExpired: If the call exceeds 60 seconds.
+    Bounded to id list (no body text) so the slim block stays sub-2KB
+    regardless of ObserveIE.md growth. The deterministic post-classify
+    dedupe in runner.py is the actual correctness gate; Haiku/Sonnet just
+    needs section + id awareness to avoid obvious recapture attempts.
+
+    On read failure, returns "(empty — ObserveIE.md unreadable)" so the
+    classifier still runs (with no known-facts context) rather than
+    crashing the pipeline.
     """
-    proc = subprocess.run(
-        ["claude", "--model", model, "--print", prompt],
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"claude exit={proc.returncode} stderr={proc.stderr[:300]}"
-        )
-    return proc.stdout
-
-
-def _read_safe(path: Path) -> str:
-    """Read a file, returning empty string on OSError (with stderr log).
-
-    WHY: ObserveIE.md may not exist on first run. We don't want that to
-    abort classification — Haiku will just see "(empty)" for already_known,
-    which is correct behavior. The error is still logged so file-permission
-    issues aren't silently swallowed (spec §9).
-
-    Args:
-        path: File to read.
-
-    Returns:
-        File contents as string, or "" if the file cannot be read.
-    """
+    if not observeie_md_path.exists():
+        return "(empty — ObserveIE.md does not exist yet)"
     try:
-        return path.read_text(encoding="utf-8")
+        text = observeie_md_path.read_text(encoding="utf-8")
     except OSError as exc:
         print(
-            f"[observe-learning-capture] classifier.py: cannot read {path}: {exc}",
+            f"[observe-learning-capture] classifier.py: cannot read "
+            f"ObserveIE.md for slim known-facts: {exc}",
             file=sys.stderr,
         )
-        return ""
+        return "(empty — ObserveIE.md unreadable)"
+
+    # Walk the file, tracking current section header and collecting ids.
+    sections: dict[str, list[str]] = {}
+    current_section: Optional[str] = None
+    for line in text.splitlines():
+        if line.startswith("## "):
+            current_section = line[3:].strip()
+            sections.setdefault(current_section, [])
+        elif current_section is not None:
+            m = _OBSERVEIE_ID_RE.search(line)
+            if m:
+                sections[current_section].append(m.group(1))
+
+    if not sections:
+        return "(empty — no sections found in ObserveIE.md)"
+
+    parts = []
+    for section, ids in sections.items():
+        parts.append(f"Section: {section}")
+        if ids:
+            parts.append(f"  Known ids: {', '.join(ids)}")
+        else:
+            parts.append("  Known ids: (none)")
+    return "\n".join(parts)
+
+
+def _invoke_classifier(
+    static_template: str,
+    slim_known_facts: str,
+    user_message: str,
+    model: str,
+) -> tuple[str, object]:
+    """Call the Anthropic SDK with layered cacheable system blocks.
+
+    Returns (text_output, usage) where text_output is the first text block
+    of the response and usage is the response.usage object (for cache
+    visibility in callers).
+
+    Bug 2 fix: replaces subprocess.run(['claude','--print',prompt],...).
+    Eliminates: recursive Claude-Code-from-inside-Claude-Code invocation,
+    60s subprocess ceiling, full ObserveIE.md re-processed every call.
+
+    max_retries=0 so we own the retry budget; SDK's default 2 retries
+    with exponential backoff would otherwise compound with timeout=120
+    to ~6 min worst-case wall time (hook subshell may be reaped first).
+
+    cache_control: ephemeral on both system blocks. Sonnet 4.5's 1024-token
+    cache minimum lets the slim payload (~1KB) actually cache, unlike
+    Haiku 4.5's 4096-token min which would silently no-op.
+
+    NOTE: max_retries is an Anthropic() constructor arg, NOT a
+    messages.create() kwarg. Validator caught this during plan review —
+    passing max_retries to create() raises TypeError on first call.
+    """
+    # max_retries=0 on the client (constructor) — NOT on messages.create()
+    client = anthropic.Anthropic(max_retries=0)  # auto-loads ANTHROPIC_API_KEY
+    response = client.messages.create(
+        model=model,
+        max_tokens=2048,
+        system=[
+            {
+                "type": "text",
+                "text": static_template,
+                "cache_control": {"type": "ephemeral"},
+            },
+            {
+                "type": "text",
+                "text": slim_known_facts,
+                "cache_control": {"type": "ephemeral"},
+            },
+        ],
+        messages=[{"role": "user", "content": user_message}],
+        timeout=120,
+    )
+    # Defensive content extraction — handles thinking blocks, multi-block responses
+    text_output = next(
+        (b.text for b in response.content if getattr(b, "type", None) == "text"),
+        "",
+    )
+    return text_output, response.usage
 
 
 def _raw_to_candidate(
@@ -389,6 +564,11 @@ def build_marker_candidate(
     caller's contract. This marker ensures the human reviewer sees the
     failure at `/observe-review` time rather than having it silently vanish.
 
+    Bug 3 fix: failure_reason is sanitized via _sanitize() before being
+    embedded in fact/excerpt fields, capping length at 200 chars and
+    stripping newlines. Without this, subprocess.TimeoutExpired.__str__()
+    poisoned the pending YAML queue.
+
     Args:
         failure_reason: Human-readable description of what failed.
         session_id: Claude Code session identifier for provenance.
@@ -399,9 +579,10 @@ def build_marker_candidate(
         Candidate with title "[FAILURE] classifier", section "Plugin Self-Errors",
         confidence "low", and tag "self-error".
     """
+    safe_reason = _sanitize(failure_reason)
     return Candidate.create(
         title="[FAILURE] classifier",
-        fact=f"Classifier failed: {failure_reason}",
+        fact=f"Classifier failed: {safe_reason}",
         proposed_section="Plugin Self-Errors",
         confidence="low",
         tags=["self-error"],
@@ -409,7 +590,7 @@ def build_marker_candidate(
             session_id=session_id, cwd=cwd,
             captured_at=captured_at,
             # Excerpt includes the reason so reviewers don't need to check logs.
-            excerpt=f"Auto-generated marker. Reason: {failure_reason}",
+            excerpt=f"Auto-generated marker. Reason: {safe_reason}",
         ),
         classifier=None,
     )

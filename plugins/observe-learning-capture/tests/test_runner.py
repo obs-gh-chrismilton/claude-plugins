@@ -40,7 +40,13 @@ class TestRunner(unittest.TestCase):
                 "haiku_model": "m",
                 "prompt_version": "1.0",
             }
-            with mock.patch("pipeline.runner._load_config", return_value=config):
+            # Mock _auth_precheck to True so we exercise the no-turn early
+            # return path (Task 10 wired the precheck before classifier
+            # construction; without this mock the precheck would fail on
+            # missing ANTHROPIC_API_KEY and emit its own marker, growing
+            # the pending file before we ever reach the no-turn branch).
+            with mock.patch("pipeline.runner._load_config", return_value=config), \
+                 mock.patch("pipeline.runner._auth_precheck", return_value=True):
                 with mock.patch.object(
                     sys, "argv",
                     ["runner.py", "--mode", "stop",
@@ -88,7 +94,10 @@ class TestRunner(unittest.TestCase):
                 "haiku_model": "m",
                 "prompt_version": "1.0",
             }
+            # Mock _auth_precheck to True so missing ANTHROPIC_API_KEY in
+            # the test env doesn't short-circuit before classify runs.
             with mock.patch("pipeline.runner._load_config", return_value=config), \
+                 mock.patch("pipeline.runner._auth_precheck", return_value=True), \
                  mock.patch("pipeline.classifier.Classifier.classify",
                             return_value=[mock_candidate]):
                 with mock.patch.object(
@@ -153,7 +162,11 @@ class TestRunner(unittest.TestCase):
                 "haiku_model": "m",
                 "prompt_version": "1.0",
             }
+            # Mock _auth_precheck to True so missing ANTHROPIC_API_KEY in
+            # the test env doesn't short-circuit and append a marker to
+            # pending (which would defeat the dedup-size assertion below).
             with mock.patch("pipeline.runner._load_config", return_value=config), \
+                 mock.patch("pipeline.runner._auth_precheck", return_value=True), \
                  mock.patch("pipeline.classifier.Classifier.classify",
                             return_value=[duplicate]):
                 with mock.patch.object(
