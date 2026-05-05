@@ -12,7 +12,7 @@ import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, Optional, Tuple
+from typing import Iterator, List, Optional, Tuple
 
 
 # Patterns that mark a user-typed JSONL record as NOT a real user prompt.
@@ -164,6 +164,57 @@ def last_assistant_turn(path: Path) -> Optional[Turn]:
         if turn is not None and turn.role == "assistant":
             last = turn
     return last
+
+
+def current_logical_turn(path: Path) -> Optional[Turn]:
+    """Return the substantive content of the most recent logical turn.
+
+    Bug 1 fix: prior code (last_assistant_turn) returned only the LAST
+    single assistant JSONL record. Modern Claude Code emits ~6 records
+    per logical turn (interleaved text/thinking/tool_use); the last one
+    is often a tool_use chunk (empty after text-filter) or a 7-char ack
+    like "Saved." that fails the prefilter's 150-char gate.
+
+    This function walks the records list backward, collecting text from
+    each consecutive assistant record. It stops at the first record where
+    _is_real_user_prompt returns True (a real user prompt — not a slash
+    command, hook injection, or tool_result). The collected text is then
+    re-reversed (so it reads chronologically) and joined.
+
+    Returns None if no assistant text was collected (transcript missing,
+    empty, or the current turn has no text-bearing records).
+    """
+    records = list(_iter_jsonl(path))
+    if not records:
+        return None
+
+    collected_texts: List[str] = []
+    last_assistant_record: Optional[dict] = None
+    for record in reversed(records):
+        if record.get("type") == "assistant":
+            text = _extract_text(record.get("message", {}).get("content"))
+            if text:
+                collected_texts.append(text)
+                if last_assistant_record is None:
+                    last_assistant_record = record
+            continue
+        if _is_real_user_prompt(record):
+            break  # boundary of the current logical turn
+        # Otherwise: tool_result records, slash commands, hook injections —
+        # walk through them without collecting and without stopping.
+
+    if not collected_texts:
+        return None
+
+    # Re-reverse so the joined text reads chronologically.
+    chronological = list(reversed(collected_texts))
+    full_text = "\n".join(chronological)
+    return Turn(
+        role="assistant",
+        text=full_text,
+        uuid=(last_assistant_record or {}).get("uuid", ""),
+        timestamp=(last_assistant_record or {}).get("timestamp", ""),
+    )
 
 
 def last_turn_pair(path: Path) -> Tuple[Optional[Turn], Optional[Turn]]:
