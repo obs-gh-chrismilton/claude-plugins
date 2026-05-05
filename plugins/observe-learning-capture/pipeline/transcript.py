@@ -29,7 +29,14 @@ _USER_INJECTION_PREFIXES = (
     "<command-name>",
     "<system-reminder>",
     "<local-command-stdout>",
-    "=== ",  # SessionStart hook injection blocks (e.g., this plugin's own)
+    "<bash-input>",
+    "<bash-stdout>",
+    "<bash-stderr>",
+    "<ide_selection>",
+    # Tightened from bare "=== " to namespace on this plugin's own
+    # SessionStart marker only; bare "=== " would misclassify legitimate
+    # markdown banner rules like "=== Section ===" as injections.
+    "=== OBSERVE",
 )
 
 

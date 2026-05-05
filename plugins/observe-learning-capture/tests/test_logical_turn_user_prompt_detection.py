@@ -66,3 +66,30 @@ class TestIsRealUserPrompt(unittest.TestCase):
         from pipeline.transcript import _is_real_user_prompt
         record = {"type": "assistant", "message": {"content": "I am the assistant"}}
         self.assertFalse(_is_real_user_prompt(record))
+
+    def test_bash_input_tag_is_not_real_prompt(self):
+        from pipeline.transcript import _is_real_user_prompt
+        record = {"type": "user", "message": {"content": "<bash-input>ls -la</bash-input>"}}
+        self.assertFalse(_is_real_user_prompt(record))
+
+    def test_bash_stdout_tag_is_not_real_prompt(self):
+        from pipeline.transcript import _is_real_user_prompt
+        record = {"type": "user", "message": {"content": "<bash-stdout>file output</bash-stdout>"}}
+        self.assertFalse(_is_real_user_prompt(record))
+
+    def test_bash_stderr_tag_is_not_real_prompt(self):
+        from pipeline.transcript import _is_real_user_prompt
+        record = {"type": "user", "message": {"content": "<bash-stderr>error msg</bash-stderr>"}}
+        self.assertFalse(_is_real_user_prompt(record))
+
+    def test_ide_selection_tag_is_not_real_prompt(self):
+        from pipeline.transcript import _is_real_user_prompt
+        record = {"type": "user", "message": {"content": "<ide_selection>some code</ide_selection>"}}
+        self.assertFalse(_is_real_user_prompt(record))
+
+    def test_bare_section_separator_is_now_real_prompt(self):
+        # Tightened: `=== Section ===` is now treated as real user prompt
+        # (was misclassified as injection in earlier draft)
+        from pipeline.transcript import _is_real_user_prompt
+        record = {"type": "user", "message": {"content": "=== My Section Header ==="}}
+        self.assertTrue(_is_real_user_prompt(record))
