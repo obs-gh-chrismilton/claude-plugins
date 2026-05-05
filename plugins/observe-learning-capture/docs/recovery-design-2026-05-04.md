@@ -422,3 +422,22 @@ Explicitly **rejected** ideas (with rationale, all per architect review):
 - ❌ `.in-flight-<session>.lock` files — false positives on normal force-quit make this fragile.
 - ❌ Marker emission on bash JSONL parse race — `_iter_jsonl` already silently skips malformed lines; sufficient.
 - ❌ Sonnet alternative: padding Haiku prompt with filler to reach 4096-token cache min — wastes tokens, obscures diagnostics, fights the platform.
+
+---
+
+## Verification Evidence
+
+**Date:** 2026-05-05
+**Verified by:** Chris Milton
+
+| Step | Status | Notes |
+|------|--------|-------|
+| 16.1 `ANTHROPIC_API_KEY` exported in shell | ✅ | Added to `~/.zshrc` |
+| 16.2 Missing-key path emits informative marker | ✅ | `_auth_precheck` returned False; pending file got `[FAILURE] classifier` marker with full remediation hint (mentions `ANTHROPIC_API_KEY` + `~/.zshrc` + restart) |
+| 16.3 Happy-path real Sonnet call → real candidate | **deferred** | Decision: defer to organic post-deploy verification. Rationale: Claude Code's process-env was set BEFORE the new `ANTHROPIC_API_KEY` was added, so this session's hook subshells can't see it; restart required. Stronger signal anyway: real Stop event on a real OPAL conversation after reinstall, not synthetic-transcript exercise. The marker contract (every error path emits a marker) is the safety net if any SDK-call regression slipped through unit tests. |
+| 16.4 `render_pending` happy path → review block on stdout | ✅ | Valid YAML pending file → `=== OBSERVE LEARNING CAPTURE — PENDING REVIEW ===` block, exit 0 |
+| 16.5 Malformed YAML → `RENDER FAILED` block on stdout | ✅ | Binary bytes (`\xff\xfe\xfd...`) → UnicodeDecodeError caught → `RENDER FAILED` block with class+message+recovery hint, exit 0 (NOT silent) |
+| 16.6 Log review for new warnings | ✅ | No new errors from test runs; production hook log still shows old plugin behavior (expected — recovery branch not yet deployed) |
+| 16.7 Full test suites green | ✅ | 133 Python tests + 7 bash stop-hook + 3 bash session-start subtests, all green |
+
+**Verification verdict:** **5/7 steps PASS**, **1 deferred to organic post-deploy verification** (Step 16.3 — needs Claude Code restart to inherit new env var; better signal comes from real-world Stop events after deploy than from a synthetic-transcript SDK call). The marker contract is the safety net — if any SDK call regression survived unit tests, it'll surface as a marker on first real Stop event after the recovery branch ships.
