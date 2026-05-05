@@ -1,14 +1,13 @@
-"""Haiku-based classifier for learning candidates.
+"""Classifier for learning candidates.
 
-Invokes the `claude` CLI as a subprocess (no API key handling here — the
-CLI manages auth). On any failure, emits a "marker candidate" so the
-human sees the failure at next review (per spec §9 — log AND surface).
+Invokes the Anthropic SDK directly (auth via ANTHROPIC_API_KEY in env).
+On any failure, emits a "marker candidate" so the human sees the failure
+at next review (per spec §9 — log AND surface).
 """
 from __future__ import annotations
 
 import os
 import re
-import subprocess
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -510,62 +509,6 @@ def _invoke_classifier(
         "",
     )
     return text_output, response.usage
-
-
-def _invoke_haiku(prompt: str, model: str) -> str:
-    """Call the `claude` CLI with --model and --print. Returns stdout.
-
-    Uses subprocess (not the SDK) so the CLI handles auth — no API key
-    management needed here. Timeout is 60 seconds to avoid blocking the
-    SessionStop hook indefinitely.
-
-    Args:
-        prompt: Fully rendered prompt string to pass as the last argument.
-        model: Claude model ID string (e.g. "claude-haiku-4-5-20251001").
-
-    Returns:
-        stdout text from the `claude` CLI.
-
-    Raises:
-        RuntimeError: If the subprocess exits with a non-zero return code.
-        OSError: If the subprocess cannot be started (e.g., `claude` not found).
-        subprocess.TimeoutExpired: If the call exceeds 60 seconds.
-    """
-    proc = subprocess.run(
-        ["claude", "--model", model, "--print", prompt],
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"claude exit={proc.returncode} stderr={proc.stderr[:300]}"
-        )
-    return proc.stdout
-
-
-def _read_safe(path: Path) -> str:
-    """Read a file, returning empty string on OSError (with stderr log).
-
-    WHY: ObserveIE.md may not exist on first run. We don't want that to
-    abort classification — Haiku will just see "(empty)" for already_known,
-    which is correct behavior. The error is still logged so file-permission
-    issues aren't silently swallowed (spec §9).
-
-    Args:
-        path: File to read.
-
-    Returns:
-        File contents as string, or "" if the file cannot be read.
-    """
-    try:
-        return path.read_text(encoding="utf-8")
-    except OSError as exc:
-        print(
-            f"[observe-learning-capture] classifier.py: cannot read {path}: {exc}",
-            file=sys.stderr,
-        )
-        return ""
 
 
 def _raw_to_candidate(
