@@ -67,25 +67,73 @@ if [[ -z "$TRANSCRIPT" || ! -f "$TRANSCRIPT" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Extract last assistant turn text via jq.
+# Extract the CURRENT LOGICAL TURN text via jq (mirrors Python's
+# pipeline.transcript.current_logical_turn — Bug 1d fix).
 #
-# jq logic:
-#   - Slurp all lines into an array.
-#   - Select only records with .type == "assistant".
-#   - For each, extract content:
-#       - If .message.content is a string → use it directly.
-#       - If it's an array → join all text blocks.
-#   - Take the last element of that array ([-1]).
-#   - If no assistant turn found, default to empty string.
+# WHY a walk-back, not just "last assistant record":
+#   Modern Claude Code emits ~6 JSONL records per logical turn (interleaved
+#   text / thinking / tool_use). The LAST assistant record is often a
+#   tool_use chunk (no text after the text-block filter) or a 7-char ack
+#   like "Saved." that fails Gate 1 (150-char minimum). Picking only the
+#   last record causes the prefilter to false-reject substantive turns.
+#
+# Algorithm (mirrors current_logical_turn in pipeline/transcript.py):
+#   1. Slurp all records into an array, then walk them in REVERSE.
+#   2. For each assistant record, extract the joined text from its
+#      .message.content (string-form OR array-of-blocks form), and
+#      collect into a list.
+#   3. Stop when we hit a real user prompt — defined as type == "user"
+#      AND content is a STRING (not a list — list content == tool_result)
+#      AND the string does NOT start with one of the injection prefixes
+#      (slash commands, hook injections, bash IO captures, ide_selection,
+#      this plugin's own SessionStart marker).
+#   4. Re-reverse the collected texts so they read chronologically and
+#      join with newlines. This is the "current logical turn" text.
+#
+# The injection-prefix list MUST stay in sync with _USER_INJECTION_PREFIXES
+# in pipeline/transcript.py — drift here causes prefilter/classifier
+# disagreement on where one logical turn ends and the next begins.
 # ---------------------------------------------------------------------------
 TURN_TEXT=$(jq -rsc '
-    [.[]
-     | select(.type == "assistant")
-     | .message.content
-     | (if type == "string" then .
-        else map(select(.type == "text") | .text) | join("\n")
-        end)
-    ][-1] // ""
+    # Helper: extract joined text from an assistant message .content,
+    # handling both string-form and array-of-blocks form.
+    def assistant_text(content):
+        if (content | type) == "string" then content
+        else content
+             | map(select(.type == "text") | .text)
+             | join("\n")
+        end;
+
+    # Helper: is this record a real user-typed prompt (the boundary that
+    # ends the current logical turn walk-back)?
+    def is_real_user_prompt(rec):
+        rec.type == "user"
+        and (rec.message.content | type) == "string"
+        and (rec.message.content
+             | ltrimstr(" ") | ltrimstr("\t") | ltrimstr("\n")
+             | test("^(/clear|/compact|/init|/cost|/help|/memory|<command-name>|<system-reminder>|<local-command-stdout>|<bash-input>|<bash-stdout>|<bash-stderr>|<ide_selection>|=== OBSERVE)")
+             | not);
+
+    # Walk records in reverse, accumulating assistant text until we hit
+    # a real user prompt. Reduce produces a state object:
+    #   { stopped: bool, texts: [collected texts in reverse order] }
+    [.[]] | reverse
+    | reduce .[] as $rec (
+        {stopped: false, texts: []};
+        if .stopped then .
+        elif $rec.type == "assistant" then
+            (assistant_text($rec.message.content)) as $t
+            | if ($t | length) > 0
+              then .texts += [$t]
+              else .
+              end
+        elif is_real_user_prompt($rec) then
+            .stopped = true
+        else
+            .   # tool_result / slash command / hook injection — skip past
+        end
+    )
+    | .texts | reverse | join("\n")
 ' "$TRANSCRIPT" 2>/dev/null) || TURN_TEXT=""
 
 if [[ -z "$TURN_TEXT" ]]; then
