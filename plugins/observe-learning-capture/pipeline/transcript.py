@@ -15,6 +15,56 @@ from pathlib import Path
 from typing import Iterator, Optional, Tuple
 
 
+# Patterns that mark a user-typed JSONL record as NOT a real user prompt.
+# These are slash-commands and synthetic injections that Claude Code writes
+# as type=user, content=string but which weren't typed by the human user.
+# See pipeline/transcript.py:current_logical_turn for use.
+_USER_INJECTION_PREFIXES = (
+    "/clear",
+    "/compact",
+    "/init",
+    "/cost",
+    "/help",
+    "/memory",
+    "<command-name>",
+    "<system-reminder>",
+    "<local-command-stdout>",
+    "=== ",  # SessionStart hook injection blocks (e.g., this plugin's own)
+)
+
+
+def _is_real_user_prompt(record: dict) -> bool:
+    """Return True iff this JSONL record represents a real user-typed prompt.
+
+    Bug 1 fix: the "current logical turn" walker uses this to know when
+    to stop walking back through the transcript. Modern Claude Code emits
+    user-typed records for many non-prompt events: tool_results (list
+    content), slash-commands like /clear and /compact (string content,
+    but not really a prompt), and hook-injected synthetic blocks (this
+    plugin's own SessionStart review block, for instance).
+
+    Returns False for:
+    - records where type != "user"
+    - records whose content is a list (tool_results)
+    - records whose string content starts with a known injection prefix
+
+    Per code-architect drift-detection note: callers should consider
+    emitting a marker when this returns False on a string-content user
+    record that doesn't match any known prefix — that signals a new
+    injection type has shipped that we don't recognize yet.
+    """
+    if record.get("type") != "user":
+        return False
+    content = record.get("message", {}).get("content")
+    if not isinstance(content, str):
+        return False  # tool_results and other list-content records
+    stripped = content.lstrip()
+    for prefix in _USER_INJECTION_PREFIXES:
+        if stripped.startswith(prefix):
+            return False
+    return True
+
+
 @dataclass
 class Turn:
     """A single turn from the session transcript."""
