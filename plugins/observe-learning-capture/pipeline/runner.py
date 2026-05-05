@@ -35,7 +35,7 @@ import anthropic
 from pipeline.classifier import Classifier, build_marker_candidate
 from pipeline.dedupe import extract_existing_ids, is_duplicate
 from pipeline.stage import append_candidates, read_pending
-from pipeline.transcript import last_assistant_turn, all_assistant_turns
+from pipeline.transcript import current_logical_turn, all_assistant_turns
 
 
 def main() -> int:
@@ -150,13 +150,8 @@ def main_with_args(
         # Build turn text based on mode
         # ------------------------------------------------------------------
         if mode == "stop":
-            # TODO Task 14: swap last_assistant_turn -> current_logical_turn
-            # (current_logical_turn is created in Task 13; using the existing
-            # primitive here keeps the test suite green between Tasks 10-13.)
-            turn = last_assistant_turn(transcript_path)
+            turn = current_logical_turn(transcript_path)
             if turn is None:
-                # No assistant turn yet (e.g. hook fired at session start
-                # before Claude has responded). Not an error — nothing to do.
                 return 0
             turn_text = turn.text
             excerpt = turn.text[:200]
