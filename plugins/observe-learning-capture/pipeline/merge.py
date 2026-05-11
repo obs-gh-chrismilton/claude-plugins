@@ -126,6 +126,15 @@ def _log_merge(candidate: Candidate, observeie_md: Path) -> None:
 
     Log path: ~/.claude/logs/observe-learning-capture.log
 
+    Scope filter (added 2026-05-11): only writes an audit entry when the
+    merge target is inside the canonical production directory
+    ($HOME/.claude/agents/). Test-fixture merges that target a temp
+    directory (pytest's TemporaryDirectory) are skipped silently so they
+    don't pollute the production log. Symptom this fixes: a single
+    `unittest discover` run was writing 9+ MERGE audit lines per test
+    invocation, indistinguishable from real production merges in the
+    log, breaking any tail/grep-based production monitoring.
+
     Tolerant of log-write failures — logs to stderr and continues rather
     than raising, because an audit-log failure must not block a successful
     merge. This is the only deliberate exception to the "belt-and-suspenders,
@@ -136,6 +145,22 @@ def _log_merge(candidate: Candidate, observeie_md: Path) -> None:
         candidate: The Candidate that was just merged.
         observeie_md: Path to the ObserveIE.md that received the merge.
     """
+    # Scope check: only canonical production merges get audited.
+    # The canonical dir is $HOME/.claude/agents/; anything else (typically
+    # a tempfile.TemporaryDirectory() target from a test) is silently
+    # skipped so the production log stays uncluttered.
+    canonical_agents_dir = Path(os.path.expanduser("~/.claude/agents")).resolve()
+    try:
+        target_resolved = observeie_md.resolve()
+    except OSError:
+        # Path resolution failed (broken symlink, missing parents). Treat
+        # as non-canonical to be safe — better to under-log than to write
+        # noise when the target is malformed.
+        return
+    # is_relative_to was added in Python 3.9. We accept that minimum.
+    if not target_resolved.is_relative_to(canonical_agents_dir):
+        return
+
     log_path = Path(os.path.expanduser("~/.claude/logs/observe-learning-capture.log"))
     try:
         log_path.parent.mkdir(parents=True, exist_ok=True)
