@@ -21,7 +21,6 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from pipeline.stage import read_pending
 from pipeline.types import Candidate
 
 
@@ -164,14 +163,31 @@ def remove_from_pending(candidate_id: str, pending_file: Path) -> None:
     """Remove the candidate with matching id from the pending staging file.
 
     This is the ONLY operation in the pipeline that rewrites (rather than
-    appends to) the pending file. It is only called after a successful merge
-    so the promoted candidate is not re-surfaced for review.
+    appends to) the pending file. Called after a successful merge so the
+    promoted candidate is not re-surfaced for review, and from the
+    --discard path of merge_cli.
 
-    WHY re-import _render_yaml here (not at module top):
-    stage.py imports from pipeline.types; merge.py imports from pipeline.stage.
-    If stage.py were to import from pipeline.merge, that would be a circular
-    import. The deferred import here is an intentional pattern that keeps the
-    dependency direction one-way: merge → stage → types.
+    Implementation note: text-surgery, not parse-and-reserialize.
+    ============================================================
+    Previous versions read the file via read_pending() (YAML parser) and
+    rewrote the surviving records by re-rendering them with _render_yaml.
+    That approach has two failure modes:
+
+      1. Records the parser couldn't interpret (malformed YAML, unrecognized
+         shapes) were silently dropped on rewrite. The parser already logs
+         "skipped malformed YAML record" to stderr; the rewrite then made
+         that drop permanent on disk -- data loss.
+      2. Even valid records had their formatting normalized: inline lists
+         (`tags: [a, b]`) became block lists (`tags:\\n  - a\\n  - b`),
+         quote styles could change, indentation subtly differed. Not data
+         loss but a `git diff` headache for users version-controlling
+         `~/.claude/`.
+
+    The fix is to do text-level surgery: split the file on the same
+    document-boundary regex `_parse_yaml_list` uses (line-anchored `^---$`),
+    detect which chunks contain a top-level `id: <target>` line, and rebuild
+    the file from the chunks that DON'T match. Bytes of surviving chunks
+    are preserved verbatim; malformed records pass through untouched.
 
     Args:
         candidate_id: The `id` field of the candidate to remove.
@@ -186,35 +202,86 @@ def remove_from_pending(candidate_id: str, pending_file: Path) -> None:
         # Nothing to do — file may have been cleaned up already.
         return
 
-    records = read_pending(pending_file)
-    remaining = [r for r in records if r.get("id") != candidate_id]
+    try:
+        content = pending_file.read_text(encoding="utf-8")
+    except OSError as exc:
+        # Log and propagate — caller must know about read failures because
+        # otherwise a subsequent merge would be operating on stale state.
+        print(
+            f"[observe-learning-capture] merge.py: cannot read pending file "
+            f"{pending_file}: {exc}",
+            file=sys.stderr,
+        )
+        raise
 
-    if len(remaining) == len(records):
-        # Candidate not found in pending — no-op; avoid unnecessary rewrite.
+    # Walk the file line-by-line, grouping lines into "chunks" separated by
+    # `---` boundary lines. A chunk consists of: optional separator line +
+    # body lines. The first chunk (before the first `---`) has no separator.
+    #
+    # We avoid `re.split` because we want to preserve the EXACT separator
+    # text (e.g. `---` vs `---   ` with trailing whitespace) and the exact
+    # line endings around it.
+    boundary_re = re.compile(r"^---\s*$")
+    id_line_re = re.compile(rf"^id:\s+{re.escape(candidate_id)}\s*$")
+
+    chunks: list[tuple[str | None, list[str]]] = []
+    current_sep: str | None = None
+    current_body: list[str] = []
+    for line in content.split("\n"):
+        if boundary_re.match(line):
+            # Finalize the previous chunk before opening the new one.
+            if current_sep is not None or current_body:
+                chunks.append((current_sep, current_body))
+            current_sep = line
+            current_body = []
+        else:
+            current_body.append(line)
+    # Don't forget the trailing chunk after the last `---`.
+    if current_sep is not None or current_body:
+        chunks.append((current_sep, current_body))
+
+    # Filter: keep chunks whose body does NOT contain a top-level
+    # `id: <candidate_id>` line. Top-level means line-start, no indent --
+    # this matches the renderer's invariant that the canonical `id` lives
+    # at indent 0 in the YAML mapping. Indented mentions (e.g. an `excerpt`
+    # field that quotes another record's id) won't match by design.
+    surviving: list[tuple[str | None, list[str]]] = []
+    removed_count = 0
+    for sep, body in chunks:
+        has_target = any(id_line_re.match(line) for line in body)
+        if has_target:
+            removed_count += 1
+            continue
+        surviving.append((sep, body))
+
+    if removed_count == 0:
+        # No chunk matched — no-op. Skip rewrite entirely so file mtime and
+        # any in-flight readers are undisturbed.
         return
 
-    # Re-import here to avoid circular import (see docstring WHY above).
-    from pipeline.stage import _render_yaml  # noqa: PLC0415
+    # Rebuild output: separator (if any) followed by body lines, then join
+    # everything with `\n`. This preserves each surviving chunk's bytes
+    # exactly (body line content + ordering), only altering chunks we
+    # explicitly removed.
+    out_lines: list[str] = []
+    for sep, body in surviving:
+        if sep is not None:
+            out_lines.append(sep)
+        out_lines.extend(body)
+    new_content = "\n".join(out_lines)
+
+    # If the original file ended with a newline and our rebuild lost it
+    # (because `body` had no trailing empty element), restore it. This
+    # keeps `wc -l` and `git diff` consistent across the round-trip.
+    if content.endswith("\n") and not new_content.endswith("\n"):
+        new_content += "\n"
 
     try:
-        if not remaining:
-            # All candidates were removed — write an empty file rather than
-            # deleting it, so the path stays valid for future appends.
-            pending_file.write_text("", encoding="utf-8")
-            return
-
-        # Reconstruct the YAML document stream from the surviving records.
-        # Each record gets a `---` boundary prefix, matching the append format
-        # in stage.py so that subsequent reads parse identically.
-        chunks = []
-        for record in remaining:
-            chunks.append("---\n" + _render_yaml(record, indent=0))
-        pending_file.write_text("\n".join(chunks) + "\n", encoding="utf-8")
+        pending_file.write_text(new_content, encoding="utf-8")
     except OSError as exc:
-        # I4 fix: log full context before re-raising so the caller can see
-        # what file failed and why. Silent-swallow would leave a ghost entry
-        # in the pending queue (the merged candidate would re-surface at next
-        # review), which is a correctness bug, not just a logging gap.
+        # I4 fix preserved: log full context before re-raising so the caller
+        # sees both the exception and the human-readable message. Silent-
+        # swallow would leave a ghost entry that re-surfaces at /observe-review.
         print(
             f"[observe-learning-capture] merge.py: cannot write pending file "
             f"{pending_file}: {exc}",
