@@ -139,7 +139,12 @@ def main() -> int:
     observeie_md = tmpdir / "ObserveIE.md"
 
     classifier = Classifier(
-        model="claude-haiku-4-5-20251001",
+        # Sonnet 4.6 (latest) — switched from Haiku 4.5 on 2026-05-11 because
+        # Haiku consistently produced records missing required fields (title)
+        # in production observe-capture runs. Sonnet's stronger
+        # schema-adherence is worth the marginal cost increase for this
+        # low-volume classifier workload.
+        model="claude-sonnet-4-6",
         prompt_template_path=Path(args.prompt),
         observeie_md_path=observeie_md,
     )

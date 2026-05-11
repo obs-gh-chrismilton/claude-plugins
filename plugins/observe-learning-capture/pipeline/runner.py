@@ -136,7 +136,7 @@ def main_with_args(
 
     try:
         classifier = Classifier(
-            model=config.get("classifier_model", config.get("haiku_model", "claude-sonnet-4-5")),
+            model=config.get("classifier_model", config.get("haiku_model", "claude-sonnet-4-6")),
             prompt_template_path=plugin_root / "prompts" / "classifier.md",
             observeie_md_path=destination_path,
             prompt_version=config["prompt_version"],
