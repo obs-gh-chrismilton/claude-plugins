@@ -20,6 +20,7 @@ Exits 0 to allow, exits 2 to block (with reason on stderr).
 """
 
 import json
+import os
 import re
 import sys
 
@@ -130,6 +131,13 @@ def main():
     try:
         hook_input = json.load(sys.stdin)
     except (json.JSONDecodeError, EOFError):
+        sys.exit(0)
+
+    # Session-scope guard: no-op when no optimizer run is in progress.
+    # /tmp/opal-optimizer/ exists only during an active optimizer run; without
+    # that marker this hook over-applies globally to all Bash/Write/Edit calls
+    # and blocks legitimate non-optimizer Observe API work.
+    if not os.path.isdir("/tmp/opal-optimizer"):
         sys.exit(0)
 
     tool_name = hook_input.get("tool_name", "")
