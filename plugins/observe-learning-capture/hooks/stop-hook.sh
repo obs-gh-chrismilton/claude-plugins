@@ -20,6 +20,18 @@
 
 set -uo pipefail
 
+# Force the classifier subprocess (`claude -p`) to use macOS-keychain
+# subscription auth rather than any API key inherited from the parent
+# Claude Code process. The hook subprocess inherits Claude Code's env,
+# which on this machine includes ANTHROPIC_API_KEY (set in ~/.zshenv).
+# With the env key set, `claude -p` prefers API-key auth and hits the
+# tier-1 50K input-TPM rate limit on multi-call bursts. With the env
+# key unset, the CLI falls back to keychain auth where MAX subscription
+# has no per-minute ceiling. Empirically verified 2026-05-11:
+# 12 rapid evals with key set = 11/12 429s; with key unset = 0/12 429s.
+# See ~/.claude/projects/-Users-chmilton-Projects-DashboardDesigner/memory/project_claude_p_context_overhead.md
+unset ANTHROPIC_API_KEY
+
 HERE="$(cd "$(dirname "$0")" && pwd)"
 PLUGIN_ROOT="$(cd "$HERE/.." && pwd)"
 LOG_FILE="${HOME}/.claude/logs/observe-learning-capture.log"

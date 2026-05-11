@@ -31,12 +31,12 @@ class TestPerRecordMarker(unittest.TestCase):
     def test_one_malformed_record_emits_marker_does_not_block_batch(
         self, _slim, _build, _invoke
     ):
-        # Classifier response: 1 valid record + 1 missing title
-        # Bug 2 part 3: _invoke_classifier returns (text, usage) tuple now;
-        # tests must mock both elements. Usage is a Mock with cache-token
-        # attrs so the cache-warning hook (currently a stub) doesn't trip.
-        mock_usage = mock.Mock(cache_read_input_tokens=0, cache_creation_input_tokens=0)
-        _invoke.return_value = ("""\
+        # Classifier response: 1 valid record + 1 missing title.
+        # Post-2026-05-08 pivot: _invoke_classifier returns just the text
+        # string (no usage tuple) since the `claude -p` CLI does not
+        # expose stable usage shape and the cache-warning sentinel that
+        # consumed it was deleted.
+        _invoke.return_value = """\
 - title: "OPAL accepts foo"
   fact: |
     OPAL accepts foo as input.
@@ -48,7 +48,7 @@ class TestPerRecordMarker(unittest.TestCase):
   proposed_section: "OPAL Gotchas"
   confidence: high
   tags: [opal]
-""", mock_usage)
+"""
         # Bug 2 part 2: _build_prompt now returns a 3-tuple
         # (static_template, slim_known_facts, user_message). The test
         # only cares that classify reaches _invoke_classifier — the prompt
@@ -75,13 +75,12 @@ class TestPerRecordMarker(unittest.TestCase):
     def test_marker_failure_reason_names_missing_field(
         self, _slim, _build, _invoke
     ):
-        # Bug 2 part 3: _invoke_classifier returns (text, usage) tuple.
-        mock_usage = mock.Mock(cache_read_input_tokens=0, cache_creation_input_tokens=0)
-        _invoke.return_value = ("""\
+        # Post-2026-05-08 pivot: _invoke_classifier returns just text.
+        _invoke.return_value = """\
 - fact: "no title here"
   proposed_section: "OPAL Gotchas"
   confidence: high
-""", mock_usage)
+"""
         # Bug 2 part 2: _build_prompt now returns a 3-tuple.
         _build.return_value = ("static", "slim", "user")
 

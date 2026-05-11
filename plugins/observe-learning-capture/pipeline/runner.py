@@ -26,11 +26,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-
-import anthropic
 
 from pipeline.classifier import Classifier, build_marker_candidate
 from pipeline.dedupe import extract_existing_ids, is_duplicate
@@ -126,10 +125,13 @@ def main_with_args(
     pending_path = Path(os.path.expanduser(config["pending_file"]))
     plugin_root = Path(__file__).parent.parent
 
-    # Bug 2 fix: auth precheck before any classifier work begins.
-    # On failure the precheck has ALREADY emitted a marker via direct
-    # append_candidates, so we just return 0 cleanly — no further work.
-    if not _auth_precheck(pending_path, session_id, cwd):
+    # CLI precheck before any classifier work begins. On failure the precheck
+    # has ALREADY emitted a marker via direct append_candidates, so we just
+    # return 0 cleanly — no further work. Replaces the SDK-era _auth_precheck
+    # which validated ANTHROPIC_API_KEY against the API; we now rely on the
+    # `claude` CLI to resolve subscription auth at invocation time, and the
+    # only thing we can pre-check cheaply is whether the binary exists.
+    if not _cli_precheck(pending_path, session_id, cwd):
         return 0
 
     try:
@@ -251,17 +253,32 @@ def _load_config() -> dict:
     return json.loads(config_path.read_text(encoding="utf-8"))
 
 
-def _auth_precheck(
+def _cli_precheck(
     pending_path: Path,
     session_id: str,
     cwd: str,
 ) -> bool:
-    """Validate ANTHROPIC_API_KEY presence + correctness. Returns True if OK.
+    """Verify the `claude` binary is reachable on PATH. Returns True if OK.
 
-    Bug 2 fix part: catches both "key unset" and "key set but invalid"
-    failure modes BEFORE any classifier work. On failure, emits a marker
-    via direct append_candidates (cannot use Classifier's marker path
-    since Classifier construction may fail too).
+    This is the subprocess-pivot replacement for `_auth_precheck`. The old
+    precheck validated ANTHROPIC_API_KEY against the API via models.list;
+    we no longer use the API directly, so the only cheap pre-check
+    available at this layer is whether `claude` is invocable at all.
+
+    Why we do NOT actually run `claude --version` (or similar) here:
+        Every `claude` invocation costs subscription quota and adds
+        wall-time latency to the hook subshell. A pre-flight version
+        check would burn quota on every Stop hook even when no real
+        classification is needed (e.g. when the prefilter would
+        immediately reject the turn — though the prefilter actually
+        runs in the bash hook script BEFORE this Python pipeline starts,
+        so by the time we are here we are committed to a classifier
+        call anyway). The deeper auth check (subscription valid, not
+        rate-limited) is exercised by the first real classifier call,
+        and any failure there produces a marker via the exception
+        ladder in classifier.py the same way an explicit precheck
+        failure would. Keeping the precheck cheap and structural
+        avoids paying for the same check twice.
 
     Per spec section 9 mantra: log AND surface — never silent.
 
@@ -271,82 +288,39 @@ def _auth_precheck(
         cwd: Capture-time working directory, used for marker provenance.
 
     Returns:
-        True if the key is present AND validates against the API; False
-        otherwise (caller should short-circuit before constructing the
-        classifier). Transient API errors at precheck time return True so
-        the classifier still gets a chance — its own error handling will
-        emit a marker if the call ultimately fails.
+        True if `claude` is reachable on PATH; False otherwise. On False,
+        a marker has already been appended to `pending_path` and the
+        caller should short-circuit cleanly.
     """
     captured_at = datetime.now(timezone.utc)
 
-    # Branch 1: key not set in env at all. The hook environment may not
-    # inherit the user's shell exports, so this is a common failure mode.
-    if not os.environ.get("ANTHROPIC_API_KEY"):
+    if shutil.which("claude") is None:
         marker = build_marker_candidate(
             failure_reason=(
-                "ANTHROPIC_API_KEY not set in hook environment. "
-                "Add `export ANTHROPIC_API_KEY=sk-...` to ~/.zshrc and restart Claude Code."
+                "`claude` binary not found on PATH. The hook subprocess could "
+                "not invoke the CLI; check the hook environment's PATH or "
+                "install Claude Code."
             ),
             session_id=session_id, cwd=cwd, captured_at=captured_at,
         )
         try:
             append_candidates(pending_path, [marker])
         except Exception as exc:  # noqa: BLE001 — last-ditch surface to stderr
-            # If even the marker write fails, we still log so the failure is
-            # visible somewhere (stderr is captured by the hook framework).
+            # If even the marker write fails (disk full, permissions), we
+            # still log so the failure is visible in the hook's stderr/log.
             print(
-                f"[observe-learning-capture] runner.py: auth-precheck marker "
+                f"[observe-learning-capture] runner.py: cli-precheck marker "
                 f"write failed: {exc}",
                 file=sys.stderr,
             )
         print(
-            "[observe-learning-capture] runner.py: ANTHROPIC_API_KEY missing — "
-            "skipping classifier; marker emitted",
+            "[observe-learning-capture] runner.py: `claude` binary not on PATH "
+            "— skipping classifier; marker emitted",
             file=sys.stderr,
         )
         return False
 
-    # Branch 2: key present — validate it via models.list (free; no token
-    # consumption; stable across SDK versions). Catches the common "key
-    # rotated and stale value still in env" failure mode.
-    try:
-        client = anthropic.Anthropic()
-        client.models.list(limit=1)
-        return True
-    except anthropic.AuthenticationError as exc:
-        marker = build_marker_candidate(
-            failure_reason=f"key rejected: {getattr(exc, 'status_code', '?')} from API",
-            session_id=session_id, cwd=cwd, captured_at=captured_at,
-        )
-        try:
-            append_candidates(pending_path, [marker])
-        except Exception:  # noqa: BLE001 — best-effort marker write
-            pass
-        print(
-            f"[observe-learning-capture] runner.py: API key rejected: {exc}",
-            file=sys.stderr,
-        )
-        return False
-    except anthropic.APIError as exc:
-        # Transient connectivity / rate limit at precheck time — emit marker
-        # but ALSO return True. Reasoning: the precheck is best-effort; if
-        # the API is briefly unavailable we still want the classifier to
-        # try its own call (which has its own error handling). Don't block
-        # on transient precheck failures.
-        marker = build_marker_candidate(
-            failure_reason=f"[non-blocking] precheck transient: {type(exc).__name__}",
-            session_id=session_id, cwd=cwd, captured_at=captured_at,
-        )
-        try:
-            append_candidates(pending_path, [marker])
-        except Exception:  # noqa: BLE001 — best-effort marker write
-            pass
-        print(
-            f"[observe-learning-capture] runner.py: precheck transient error "
-            f"(continuing anyway): {exc}",
-            file=sys.stderr,
-        )
-        return True
+    return True
 
 
 if __name__ == "__main__":

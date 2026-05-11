@@ -13,6 +13,14 @@
 
 set -uo pipefail
 
+# Force subscription auth on the classifier subprocess (`claude -p`).
+# See the matching comment in stop-hook.sh for the full rationale —
+# short version: ANTHROPIC_API_KEY in env makes `claude -p` use the
+# API key's tier-1 50K input-TPM rate limit, which trips on multi-call
+# bursts; unsetting it forces keychain (MAX subscription) auth which
+# has no per-minute ceiling.
+unset ANTHROPIC_API_KEY
+
 HERE="$(cd "$(dirname "$0")" && pwd)"
 PLUGIN_ROOT="$(cd "$HERE/.." && pwd)"
 LOG_FILE="${HOME}/.claude/logs/observe-learning-capture.log"
