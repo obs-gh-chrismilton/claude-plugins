@@ -1,9 +1,10 @@
-"""Tests for pipeline.classifier — Haiku invocation orchestration.
+"""Tests for pipeline.classifier — invocation orchestration.
 
-We mock the subprocess call to `claude` CLI. Real Haiku calls are only
-exercised via end-to-end tests (Task 16).
+Most tests in this file mock `pipeline.classifier._invoke_classifier`
+directly so they are agnostic to the underlying transport. The actual
+subprocess shape is verified separately in test_classifier_subprocess.py
+(post-2026-05-08 SDK→`claude -p` subprocess pivot).
 """
-import json
 import subprocess
 import tempfile
 import unittest
@@ -47,14 +48,15 @@ class TestClassifierParser(unittest.TestCase):
 
 
 def _mock_invoke_return(text):
-    """Build a 2-tuple matching the new _invoke_classifier signature.
+    """Build the return value matching the current `_invoke_classifier`
+    signature.
 
-    The classifier now returns (text, usage). Tests that don't care about
-    cache visibility just need a usage object with the cache-token attrs
-    so the (currently stub) _maybe_emit_cache_warning hook doesn't AttributeError.
+    Post-2026-05-08 pivot: `_invoke_classifier` returns just the response
+    text (no usage tuple) since the `claude -p` CLI does not expose token
+    usage in a stable shape and the cache-warning sentinel that consumed
+    it was deleted.
     """
-    mock_usage = mock.Mock(cache_read_input_tokens=0, cache_creation_input_tokens=0)
-    return (text, mock_usage)
+    return text
 
 
 class TestClassifierEndToEnd(unittest.TestCase):
@@ -112,11 +114,16 @@ class TestMarkerCandidate(unittest.TestCase):
 class TestClassifierEdgeCases(unittest.TestCase):
     @mock.patch("pipeline.classifier._invoke_classifier")
     def test_subprocess_timeout_emits_marker(self, mock_invoke):
-        """Bug 2 part 3 update: legacy subprocess.TimeoutExpired path is dead
-        (subprocess removed); the SDK raises anthropic.APITimeoutError instead.
-        Verify the SDK timeout path lands in the marker handler."""
-        import anthropic
-        mock_invoke.side_effect = anthropic.APITimeoutError(request=mock.Mock())
+        """`claude -p` exceeded the subprocess timeout → marker.
+
+        The 2026-05-08 pivot to `claude -p` subprocess restored
+        subprocess.TimeoutExpired as the relevant exception type (the
+        SDK-era anthropic.APITimeoutError is no longer applicable; the
+        SDK is no longer imported by the classifier).
+        """
+        mock_invoke.side_effect = subprocess.TimeoutExpired(
+            cmd=["claude", "-p"], timeout=120,
+        )
         with tempfile.TemporaryDirectory() as d:
             obs = Path(d) / "ObserveIE.md"
             obs.write_text("", encoding="utf-8")

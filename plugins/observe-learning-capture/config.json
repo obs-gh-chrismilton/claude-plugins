@@ -3,7 +3,7 @@
   "pending_file": "~/.claude/agents/.observeie-pending.md",
   "fallback_pending_file": "~/.claude/agents/.observeie-pending.fallback.md",
   "log_file": "~/.claude/logs/observe-learning-capture.log",
-  "classifier_model": "claude-sonnet-4-5",
+  "classifier_model": "claude-sonnet-4-6",
   "prompt_version": "1.0",
   "prefilter": {
     "min_turn_chars": 150,

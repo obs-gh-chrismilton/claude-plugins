@@ -33,9 +33,13 @@ SAMPLE_HAIKU_OUTPUT = """\
 
 
 def _mock_invoke_return(text):
-    """2-tuple matching the new _invoke_classifier(...) -> (text, usage) signature."""
-    mock_usage = mock.Mock(cache_read_input_tokens=0, cache_creation_input_tokens=0)
-    return (text, mock_usage)
+    """Mock return for `_invoke_classifier`.
+
+    Post-2026-05-08 pivot: returns just the response text (not a tuple) —
+    the `claude -p` CLI does not expose stable usage data and the
+    cache-warning sentinel that consumed it was removed.
+    """
+    return text
 
 
 class TestEndToEnd(unittest.TestCase):
@@ -140,13 +144,18 @@ class TestEndToEnd(unittest.TestCase):
 
     @mock.patch("pipeline.classifier._invoke_classifier")
     def test_haiku_failure_emits_marker_to_pending(self, mock_invoke):
-        """SDK timeout/failure → marker candidate staged so user sees it.
+        """Classifier failure → marker candidate staged so user sees it.
 
-        Bug 2 part 3 update: subprocess.TimeoutExpired is dead — the SDK
-        raises anthropic.APITimeoutError instead. This still routes through
-        the marker handler in classifier.classify."""
-        import anthropic
-        mock_invoke.side_effect = anthropic.APITimeoutError(request=mock.Mock())
+        Post-2026-05-08 pivot: the relevant timeout exception is
+        subprocess.TimeoutExpired (CLI subprocess invocation) rather than
+        anthropic.APITimeoutError. Both route through the marker handler
+        in classifier.classify, but only the subprocess one is reachable
+        now that the SDK is no longer imported.
+        """
+        import subprocess
+        mock_invoke.side_effect = subprocess.TimeoutExpired(
+            cmd=["claude", "-p"], timeout=120,
+        )
         with tempfile.TemporaryDirectory() as d:
             tmp = Path(d)
             obs = tmp / "ObserveIE.md"

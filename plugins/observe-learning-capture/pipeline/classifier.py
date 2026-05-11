@@ -1,20 +1,42 @@
 """Classifier for learning candidates.
 
-Invokes the Anthropic SDK directly (auth via ANTHROPIC_API_KEY in env).
-On any failure, emits a "marker candidate" so the human sees the failure
+Invokes the local `claude` CLI as a subprocess so the call inherits the
+user's Claude Code subscription auth (no ANTHROPIC_API_KEY needed). On
+any failure, emits a "marker candidate" so the human sees the failure
 at next review (per spec §9 — log AND surface).
+
+Why subprocess and not the Anthropic Python SDK
+-----------------------------------------------
+The previous implementation imported `anthropic` and called
+`Anthropic().messages.create(...)` with `cache_control` markers on
+layered system blocks. That required an ANTHROPIC_API_KEY in the hook
+subprocess environment. macOS launchd does NOT inherit the user's
+interactive shell exports into hook subprocesses, so the key was
+unavailable and every classifier invocation across a 4-day window
+emitted a `[FAILURE] classifier` marker instead of doing real work.
+
+Pivoting to `claude -p` lets the call inherit the user's existing MAX
+subscription credentials from the surrounding Claude Code session via
+the macOS keychain. Trade-offs (accepted by design committee on
+2026-05-08):
+  - Cache-control markers are not exposed by the CLI; we lose the
+    fine-grained per-block ephemeral-cache strategy the SDK supported.
+  - Token usage data is not consistently extractable in a stable shape,
+    so `_invoke_classifier` returns just text (no usage tuple).
+  - Per-call quota draws from the same 5-hour rolling window as the
+    user's interactive Claude Code usage.
 """
 from __future__ import annotations
 
+import json as _json
 import os
 import re
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, List, Optional
-
-import anthropic
 
 from pipeline.stage import _parse_yaml_list
 from pipeline.types import Candidate, ClassifierMeta, Provenance
@@ -38,24 +60,22 @@ def _sanitize(reason: object) -> str:
 
 @dataclass
 class Classifier:
-    """Orchestrates Anthropic SDK invocations to produce Candidate objects.
+    """Orchestrates `claude` CLI subprocess invocations to produce Candidate
+    objects from assistant turn text.
 
     Attributes:
-        model: Claude model ID (e.g. "claude-sonnet-4-5").
+        model: Claude model ID (e.g. "claude-sonnet-4-5"). Passed via
+            `--model` so the classifier doesn't inherit whatever model
+            the parent Claude Code session is running on (interactive
+            sessions on Opus 4.7 1M would 30x the per-call cost).
         prompt_template_path: Path to the static classifier prompt template.
         observeie_md_path: Path to ObserveIE.md — slim known-facts derived
-            from this so Haiku/Sonnet avoids re-capturing known facts.
+            from this so the classifier avoids re-capturing known facts.
         prompt_version: Version label embedded in ClassifierMeta for each
             produced candidate, so prompts can be retro-evaluated later.
         pending_path: Where marker candidates are appended on failure.
             Injected (NOT hardcoded) so tests use a tmp path and never
             pollute the user's real ~/.claude/agents/.observeie-pending.md.
-        _cache_call_count: Counter of consecutive calls observed with
-            cache_read_input_tokens == 0. Reset on first cache hit.
-        _cache_sentinel_path: One-shot marker file. When present, the
-            cache-disabled warning has already been emitted and we skip
-            re-emission. Deleted on first observed cache hit so the
-            warning re-fires if the situation regresses.
     """
 
     model: str
@@ -64,10 +84,6 @@ class Classifier:
     prompt_version: str = "1.0"
     pending_path: Path = field(default_factory=lambda: Path(
         os.path.expanduser("~/.claude/agents/.observeie-pending.md")
-    ))
-    _cache_call_count: int = 0
-    _cache_sentinel_path: Path = field(default_factory=lambda: Path(
-        os.path.expanduser("~/.claude/agents/.observe-cache-warned")
     ))
 
     def classify(
@@ -79,8 +95,11 @@ class Classifier:
     ) -> List[Candidate]:
         """Run classifier on turn_text. Returns 0+ candidates.
 
-        Bug 2 fix: SDK-based, layered cacheable prompt.
-        Bug 5 fix: per-record errors emit markers, not silent skips.
+        Subprocess pivot (2026-05-08): _invoke_classifier shells out to
+        `claude -p` instead of using the Anthropic SDK. Exception ladder
+        is structured around subprocess error types (FileNotFoundError,
+        TimeoutExpired, non-zero exit, JSONDecodeError) instead of
+        anthropic.* exceptions.
 
         On any classifier failure, emit a marker (per spec §9). Errors
         logged to stderr before marker emission for visibility.
@@ -97,27 +116,60 @@ class Classifier:
                 cwd=cwd,
                 captured_at=captured_at,
             )
-            classifier_output, usage = _invoke_classifier(
+            classifier_output = _invoke_classifier(
                 static_template=static_template,
                 slim_known_facts=slim_block,
                 user_message=user_message,
                 model=self.model,
             )
-            # Cache visibility check — surface a marker if cache silently no-ops.
-            self._maybe_emit_cache_warning(usage, session_id, cwd, captured_at)
-        except anthropic.AuthenticationError as exc:
+        except FileNotFoundError as exc:
+            # `claude` binary not on PATH at invocation time. Distinguish from
+            # generic OSError so the user-actionable failure_reason is clear.
             print(
-                f"[observe-learning-capture] classifier.py: API key rejected "
-                f"for session={session_id}: {exc}",
+                f"[observe-learning-capture] classifier.py: `claude` binary "
+                f"not found for session={session_id}: {exc}",
                 file=sys.stderr,
             )
             return [build_marker_candidate(
-                failure_reason=f"key rejected: {getattr(exc, 'status_code', '?')} from API",
+                failure_reason=(
+                    "`claude` binary not found on PATH; the hook subprocess "
+                    "could not invoke the CLI"
+                ),
                 session_id=session_id, cwd=cwd, captured_at=captured_at,
             )]
-        except anthropic.APIError as exc:
+        except subprocess.TimeoutExpired as exc:
+            # `claude -p` exceeded the subprocess timeout. The exception's
+            # __str__ embeds argv (which embeds the full prompt) — _sanitize
+            # in build_marker_candidate caps that to 200 chars.
             print(
-                f"[observe-learning-capture] classifier.py: SDK error "
+                f"[observe-learning-capture] classifier.py: `claude -p` timeout "
+                f"for session={session_id} after {exc.timeout}s",
+                file=sys.stderr,
+            )
+            return [build_marker_candidate(
+                failure_reason=f"claude -p timeout after {exc.timeout}s",
+                session_id=session_id, cwd=cwd, captured_at=captured_at,
+            )]
+        except _json.JSONDecodeError as exc:
+            # `claude -p --output-format json` returned non-JSON stdout. Most
+            # likely cause: CLI version skew or a CLI-side error that didn't
+            # use the documented JSON envelope. Log and surface.
+            print(
+                f"[observe-learning-capture] classifier.py: invalid JSON from "
+                f"`claude -p` for session={session_id}: {exc}",
+                file=sys.stderr,
+            )
+            return [build_marker_candidate(
+                failure_reason=f"json parse error from claude -p: {exc}",
+                session_id=session_id, cwd=cwd, captured_at=captured_at,
+            )]
+        except subprocess.SubprocessError as exc:
+            # Catches subprocess.SubprocessError subclasses we did NOT match
+            # above (e.g. CalledProcessError if a downstream caller switches
+            # to check=True; we currently use check=False and inspect
+            # returncode manually inside _invoke_classifier).
+            print(
+                f"[observe-learning-capture] classifier.py: subprocess error "
                 f"for session={session_id}: {type(exc).__name__}: {exc}",
                 file=sys.stderr,
             )
@@ -126,7 +178,10 @@ class Classifier:
                 session_id=session_id, cwd=cwd, captured_at=captured_at,
             )]
         except (RuntimeError, OSError) as exc:
-            # Legacy compatibility — file read errors etc.
+            # _invoke_classifier raises RuntimeError when the CLI returns a
+            # non-zero exit code (the failure mode for "Not logged in" and
+            # subscription-rate-limit cases). OSError covers any I/O issue
+            # outside the subprocess itself (template read failure, etc.).
             print(
                 f"[observe-learning-capture] classifier.py: classifier failed "
                 f"for session={session_id}: {exc}",
@@ -175,69 +230,15 @@ class Classifier:
                 continue
         return result
 
-    def _maybe_emit_cache_warning(
-        self,
-        usage,
-        session_id: str,
-        cwd: str,
-        captured_at: datetime,
-    ) -> None:
-        """Surface a marker if prompt cache silently no-ops.
-
-        Per silent-failure-hunter review: if our prompt is below the model's
-        cache minimum (1024 tokens for Sonnet 4.5), cache_control markers
-        silently no-op — cache_creation_input_tokens=0, no error raised.
-        Classifier "succeeds" but pays full input cost forever with no signal.
-
-        Strategy: after 5 calls with cache_read_input_tokens consistently 0,
-        emit a one-shot marker via sentinel file. Self-healing: sentinel is
-        deleted on first observed cache_read>0 so the warning re-fires if
-        the situation regresses.
-        """
-        cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
-
-        if cache_read > 0:
-            # Caching IS working — heal any prior warning sentinel
-            # AND reset the miss counter so a transient cache-miss spike
-            # later requires a FRESH 5-miss window before re-warning.
-            self._cache_call_count = 0
-            if self._cache_sentinel_path.exists():
-                try:
-                    self._cache_sentinel_path.unlink()
-                except OSError:
-                    pass  # best-effort heal
-            return
-
-        # Cache not hitting on this call
-        self._cache_call_count += 1
-        if self._cache_call_count < 5:
-            return  # not enough evidence yet
-
-        if self._cache_sentinel_path.exists():
-            return  # already warned; don't spam
-
-        # Emit one-shot marker — uses injected pending_path, NOT hardcoded
-        # (validator caught the hardcoded path was polluting tests' real
-        # pending file and was an architectural violation).
-        from pipeline.stage import append_candidates
-        pending_path = self.pending_path
-        marker = build_marker_candidate(
-            failure_reason=(
-                f"cache disabled: prefix below threshold "
-                f"({self._cache_call_count} calls × 0 cache reads)"
-            ),
-            session_id=session_id, cwd=cwd, captured_at=captured_at,
-        )
-        try:
-            append_candidates(pending_path, [marker])
-            self._cache_sentinel_path.parent.mkdir(parents=True, exist_ok=True)
-            self._cache_sentinel_path.touch()
-        except Exception as exc:
-            print(
-                f"[observe-learning-capture] classifier.py: cache-warning "
-                f"emission failed: {exc}",
-                file=sys.stderr,
-            )
+# NOTE: `_maybe_emit_cache_warning` removed on 2026-05-08 alongside the SDK
+# pivot. The sentinel-file infrastructure assumed visibility into
+# `response.usage.cache_read_input_tokens` from the Anthropic SDK; the
+# `claude -p` CLI does not expose that data in a stable, parseable shape,
+# so cache visibility is no longer measurable from this layer. The CLI
+# manages its own cache opaquely. We accept blind operation per the design
+# committee on 2026-05-08 (the SDK's per-block cache strategy was already
+# being defeated by the CLI's full-context loading anyway, so the warning
+# wouldn't have provided actionable signal even if measurable).
 
 
 def parse_haiku_yaml_output(output: str) -> List[dict[str, Any]]:
@@ -455,60 +456,127 @@ def _generate_slim_known_facts(observeie_md_path: Path) -> str:
     return "\n".join(parts)
 
 
+# Per-call subprocess timeout (seconds). Scoped to a module constant so the
+# value is greppable and a future tuning change touches one site.
+#
+# WHY 120: the SDK path documented retries+timeout compounding to ~6min
+# worst-case; we no longer control retries (the CLI handles its own), so
+# the simpler model is "wait at most 2 minutes for the CLI to produce
+# output, otherwise emit a TimeoutExpired marker and move on." The hook
+# subshell on macOS is not bounded as aggressively as the SDK comment
+# suggested — `&`-detached background processes survive the parent's
+# completion — so 120s is comfortably within budget.
+_CLAUDE_P_TIMEOUT_SECONDS = 120
+
+
 def _invoke_classifier(
     static_template: str,
     slim_known_facts: str,
     user_message: str,
     model: str,
-) -> tuple[str, object]:
-    """Call the Anthropic SDK with layered cacheable system blocks.
+) -> str:
+    """Invoke `claude -p` as a subprocess and return the response text.
 
-    Returns (text_output, usage) where text_output is the first text block
-    of the response and usage is the response.usage object (for cache
-    visibility in callers).
+    The command line we build is:
 
-    Bug 2 fix: replaces subprocess.run(['claude','--print',prompt],...).
-    Eliminates: recursive Claude-Code-from-inside-Claude-Code invocation,
-    60s subprocess ceiling, full ObserveIE.md re-processed every call.
+        claude -p \
+            --system-prompt <STATIC + SLIM joined> \
+            --model <model> \
+            --output-format json \
+            --no-session-persistence
 
-    max_retries=0 so we own the retry budget; SDK's default 2 retries
-    with exponential backoff would otherwise compound with timeout=120
-    to ~6 min worst-case wall time (hook subshell may be reaped first).
+    The user_message is passed via STDIN (NOT argv) — see R2 from the
+    2026-05-08 risk audit. macOS ARG_MAX is ~256KB; SessionEnd-mode runs
+    concatenate ALL assistant turns into user_message and can easily blow
+    that limit, producing OSError: argument list too long. Stdin has no
+    such limit and is also more shell-safe.
 
-    cache_control: ephemeral on both system blocks. Sonnet 4.5's 1024-token
-    cache minimum lets the slim payload (~1KB) actually cache, unlike
-    Haiku 4.5's 4096-token min which would silently no-op.
+    Args:
+        static_template: The static portion of the classifier prompt
+            (instructions, output schema, etc.). Combined with
+            slim_known_facts into a single --system-prompt argument.
+        slim_known_facts: The bounded section/id summary derived from
+            ObserveIE.md so the classifier can avoid re-capturing
+            already-known facts.
+        user_message: The per-call payload — wrapped turn text plus the
+            cwd/timestamp metadata produced by `_build_prompt`. Passed
+            on stdin.
+        model: Claude model identifier (e.g. "claude-sonnet-4-5"). Passed
+            via --model. WHY explicit: without --model, claude -p inherits
+            the parent session's model which could be Opus 4.7 1M (~30x
+            the per-call cost of Sonnet 4.5).
 
-    NOTE: max_retries is an Anthropic() constructor arg, NOT a
-    messages.create() kwarg. Validator caught this during plan review —
-    passing max_retries to create() raises TypeError on first call.
+    Returns:
+        The unwrapped assistant-text payload from the JSON envelope's
+        `.result` field. May be an empty string if the model produced
+        no text output.
+
+    Raises:
+        FileNotFoundError: If the `claude` binary is not on PATH at
+            invocation time.
+        subprocess.TimeoutExpired: If the CLI did not return within
+            _CLAUDE_P_TIMEOUT_SECONDS.
+        json.JSONDecodeError: If `claude -p --output-format json`
+            returned something that is not parseable JSON. Propagates
+            so the caller's exception ladder can emit a marker.
+        RuntimeError: If `claude -p` returned a non-zero exit code. The
+            error message includes the exit code and the truncated
+            stderr so a human reader can diagnose (e.g. "Not logged in").
+
+    Caching note:
+        Cache visibility / control is unrecoverable through `claude -p`.
+        The CLI loads CLAUDE.md, project memory, and other surrounding
+        context regardless of our prompt structure, so the layered
+        per-block cache strategy the SDK supported is moot. We collapse
+        static + slim into a single --system-prompt argument and accept
+        opaque caching. See classifier.py module docstring for context.
     """
-    # max_retries=0 on the client (constructor) — NOT on messages.create()
-    client = anthropic.Anthropic(max_retries=0)  # auto-loads ANTHROPIC_API_KEY
-    response = client.messages.create(
-        model=model,
-        max_tokens=2048,
-        system=[
-            {
-                "type": "text",
-                "text": static_template,
-                "cache_control": {"type": "ephemeral"},
-            },
-            {
-                "type": "text",
-                "text": slim_known_facts,
-                "cache_control": {"type": "ephemeral"},
-            },
-        ],
-        messages=[{"role": "user", "content": user_message}],
-        timeout=120,
+    # Collapse the two cacheable system blocks into one. The SDK path used
+    # two ephemeral-cached blocks but the CLI doesn't expose cache_control,
+    # so the structural distinction no longer buys anything; one block is
+    # simpler and avoids any risk of the CLI mishandling repeated --system
+    # flags (the CLI accepts --system-prompt as a single string argument).
+    system_prompt = f"{static_template}\n\n{slim_known_facts}"
+
+    argv = [
+        "claude",
+        "-p",
+        "--system-prompt", system_prompt,
+        "--model", model,
+        "--output-format", "json",
+        "--no-session-persistence",
+    ]
+
+    # NOTE on quota cost: each call here counts against the user's MAX
+    # subscription 5-hour rolling window (shared with their interactive
+    # Claude Code usage). Per the 2026-05-08 user direction, this is
+    # acceptable; no per-day rate limiter is enforced at this layer.
+    proc = subprocess.run(
+        argv,
+        input=user_message,           # R2: pass via stdin to dodge ARG_MAX
+        capture_output=True,
+        text=True,
+        timeout=_CLAUDE_P_TIMEOUT_SECONDS,
+        check=False,                  # we inspect returncode below
     )
-    # Defensive content extraction — handles thinking blocks, multi-block responses
-    text_output = next(
-        (b.text for b in response.content if getattr(b, "type", None) == "text"),
-        "",
-    )
-    return text_output, response.usage
+
+    if proc.returncode != 0:
+        # Truncate stderr aggressively — the CLI may emit verbose context
+        # (auth failure messages with installation hints, etc.) and we want
+        # a marker that is YAML-safe and human-readable. The marker layer's
+        # _sanitize() also caps to 200 chars, but trimming here keeps the
+        # raised exception message itself bounded.
+        truncated_stderr = (proc.stderr or "").strip()[:300]
+        raise RuntimeError(
+            f"claude -p exited {proc.returncode}: {truncated_stderr or '(no stderr)'}"
+        )
+
+    # The CLI's JSON envelope is documented to put the assistant text at
+    # `.result`. We do not defensively probe other shapes — if the schema
+    # ever changes, the JSONDecodeError path or a KeyError will surface
+    # via the exception ladder rather than silently returning "".
+    parsed = _json.loads(proc.stdout)
+    return parsed.get("result", "")
 
 
 def _raw_to_candidate(
