@@ -106,47 +106,86 @@ fi
 # in pipeline/transcript.py — drift here causes prefilter/classifier
 # disagreement on where one logical turn ends and the next begins.
 # ---------------------------------------------------------------------------
-TURN_TEXT=$(jq -rsc '
-    # Helper: extract joined text from an assistant message .content,
-    # handling both string-form and array-of-blocks form.
-    def assistant_text(content):
-        if (content | type) == "string" then content
-        else content
-             | map(select(.type == "text") | .text)
-             | join("\n")
-        end;
+# Wrapped in a function so the race-retry loop below can call it
+# repeatedly without duplicating the (long) jq script. Returns the
+# extracted turn text on stdout, or empty string on any error.
+extract_turn_text() {
+    jq -rsc '
+        # Helper: extract joined text from an assistant message .content,
+        # handling both string-form and array-of-blocks form.
+        def assistant_text(content):
+            if (content | type) == "string" then content
+            else content
+                 | map(select(.type == "text") | .text)
+                 | join("\n")
+            end;
 
-    # Helper: is this record a real user-typed prompt (the boundary that
-    # ends the current logical turn walk-back)?
-    def is_real_user_prompt(rec):
-        rec.type == "user"
-        and (rec.message.content | type) == "string"
-        and (rec.message.content
-             | ltrimstr(" ") | ltrimstr("\t") | ltrimstr("\n")
-             | test("^(/clear|/compact|/init|/cost|/help|/memory|<command-name>|<system-reminder>|<local-command-stdout>|<bash-input>|<bash-stdout>|<bash-stderr>|<ide_selection>|=== OBSERVE)")
-             | not);
+        # Helper: is this record a real user-typed prompt (the boundary that
+        # ends the current logical turn walk-back)?
+        def is_real_user_prompt(rec):
+            rec.type == "user"
+            and (rec.message.content | type) == "string"
+            and (rec.message.content
+                 | ltrimstr(" ") | ltrimstr("\t") | ltrimstr("\n")
+                 | test("^(/clear|/compact|/init|/cost|/help|/memory|<command-name>|<system-reminder>|<local-command-stdout>|<bash-input>|<bash-stdout>|<bash-stderr>|<ide_selection>|=== OBSERVE)")
+                 | not);
 
-    # Walk records in reverse, accumulating assistant text until we hit
-    # a real user prompt. Reduce produces a state object:
-    #   { stopped: bool, texts: [collected texts in reverse order] }
-    [.[]] | reverse
-    | reduce .[] as $rec (
-        {stopped: false, texts: []};
-        if .stopped then .
-        elif $rec.type == "assistant" then
-            (assistant_text($rec.message.content)) as $t
-            | if ($t | length) > 0
-              then .texts += [$t]
-              else .
-              end
-        elif is_real_user_prompt($rec) then
-            .stopped = true
-        else
-            .   # tool_result / slash command / hook injection — skip past
-        end
-    )
-    | .texts | reverse | join("\n")
-' "$TRANSCRIPT" 2>/dev/null) || TURN_TEXT=""
+        # Walk records in reverse, accumulating assistant text until we hit
+        # a real user prompt. Reduce produces a state object:
+        #   { stopped: bool, texts: [collected texts in reverse order] }
+        [.[]] | reverse
+        | reduce .[] as $rec (
+            {stopped: false, texts: []};
+            if .stopped then .
+            elif $rec.type == "assistant" then
+                (assistant_text($rec.message.content)) as $t
+                | if ($t | length) > 0
+                  then .texts += [$t]
+                  else .
+                  end
+            elif is_real_user_prompt($rec) then
+                .stopped = true
+            else
+                .   # tool_result / slash command / hook injection — skip past
+            end
+        )
+        | .texts | reverse | join("\n")
+    ' "$1" 2>/dev/null || true
+}
+
+TURN_TEXT=$(extract_turn_text "$TRANSCRIPT")
+
+# ---------------------------------------------------------------------------
+# JSONL write-flush race retry (added 2026-05-11).
+#
+# Problem observed in production: Claude Code emits the Stop hook event
+# at assistant-turn end, but the JSONL transcript may not be fully
+# flushed to disk at that exact moment. The walker reads an empty or
+# partial file and returns "" — the hook then logs
+# "no assistant turn extracted — skip" and the classifier never runs
+# for that turn. This means real Observe-platform learnings on
+# substantive turns silently fail to be captured.
+#
+# Fix: retry on empty result. Each retry sleeps STOP_HOOK_RETRY_DELAY
+# seconds (default 0.2s) then re-walks the transcript. Up to
+# STOP_HOOK_MAX_RETRIES retries (default 3) — so worst-case ~600ms
+# additional wall time, still safely below the hook's overall budget.
+#
+# We log only when retries actually recovered content, so the log shows
+# how often the race bites in practice and the cost of the workaround.
+# ---------------------------------------------------------------------------
+RETRY_COUNT=0
+MAX_RETRIES="${STOP_HOOK_MAX_RETRIES:-3}"
+RETRY_DELAY="${STOP_HOOK_RETRY_DELAY:-0.2}"
+while [[ -z "$TURN_TEXT" && $RETRY_COUNT -lt $MAX_RETRIES ]]; do
+    RETRY_COUNT=$((RETRY_COUNT + 1))
+    sleep "$RETRY_DELAY"
+    TURN_TEXT=$(extract_turn_text "$TRANSCRIPT")
+done
+
+if (( RETRY_COUNT > 0 )) && [[ -n "$TURN_TEXT" ]]; then
+    log "extracted turn after $RETRY_COUNT retry/ies (JSONL flush race)"
+fi
 
 if [[ -z "$TURN_TEXT" ]]; then
     # No assistant turn in this transcript yet — nothing to classify.
