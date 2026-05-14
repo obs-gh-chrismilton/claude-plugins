@@ -68,6 +68,77 @@ class TestSubprocessInvocation(unittest.TestCase):
     """
 
     @mock.patch("pipeline.classifier.subprocess.run")
+    def test_invoke_classifier_strips_anthropic_env_vars(self, mock_run):
+        """Subprocess MUST be launched with env= that excludes
+        ANTHROPIC_API_KEY and ANTHROPIC_AUTH_TOKEN.
+
+        WHY this test exists (2026-05-14 bug A):
+        `claude -p` walks an auth-resolution chain where env vars take
+        precedence over the macOS keychain credential. The parent Claude
+        Code session is on the user's MAX subscription (resolved via
+        keychain at session start). If we let the subprocess inherit
+        ANTHROPIC_API_KEY from os.environ, `claude -p` re-resolves auth,
+        the env var wins, and the call silently bills against an API tier
+        the user does not want billed — or fails with "Credit balance is
+        too low" if that tier has zero balance.
+
+        Hard rule from global CLAUDE.md (Anthropic API Key Policy):
+        "Anthropic model invocations must go through my MAX subscription
+        via the parent Claude Code session's auth context (macOS keychain
+        credential), NEVER through the ANTHROPIC_API_KEY env var."
+
+        The bash hook (`stop-hook.sh` line 33) already does
+        `unset ANTHROPIC_API_KEY` before forking the Python pipeline.
+        This test guards the Python-side defense in depth so that the
+        /observe-capture slash command (which does NOT shell-unset) and
+        any future caller cannot reintroduce the leak.
+        """
+        from pipeline.classifier import _invoke_classifier
+
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0,
+            stdout=_claude_p_json("[]"),
+            stderr="",
+        )
+
+        # Force both vars into the environment for the duration of this test
+        # so we can verify the subprocess.run call strips them out.
+        with mock.patch.dict(os.environ, {
+            "ANTHROPIC_API_KEY": "sk-ant-fake-test-only",
+            "ANTHROPIC_AUTH_TOKEN": "fake-auth-token-test-only",
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        }, clear=False):
+            _invoke_classifier(
+                static_template="STATIC",
+                slim_known_facts="SLIM",
+                user_message="USER MESSAGE",
+                model="claude-sonnet-4-5",
+            )
+
+        called_args, called_kwargs = mock_run.call_args
+        env = called_kwargs.get("env")
+        self.assertIsNotNone(
+            env,
+            "subprocess.run must be called with an explicit env= kwarg "
+            "so we can guarantee ANTHROPIC_* vars are stripped.",
+        )
+        self.assertNotIn(
+            "ANTHROPIC_API_KEY", env,
+            "ANTHROPIC_API_KEY must be stripped from subprocess env "
+            "(would force `claude -p` onto API auth instead of keychain).",
+        )
+        self.assertNotIn(
+            "ANTHROPIC_AUTH_TOKEN", env,
+            "ANTHROPIC_AUTH_TOKEN must also be stripped — same auth-leak "
+            "risk as ANTHROPIC_API_KEY.",
+        )
+        # PATH must survive — without it the subprocess can't locate `claude`.
+        self.assertIn(
+            "PATH", env,
+            "non-sensitive env (PATH) must pass through to the subprocess.",
+        )
+
+    @mock.patch("pipeline.classifier.subprocess.run")
     def test_invoke_classifier_calls_claude_p_with_expected_flags(self, mock_run):
         """The subprocess must be `claude -p ... --system-prompt ... --model ...
         --output-format json --no-session-persistence` (in some order).
@@ -297,6 +368,71 @@ class TestSubprocessErrorHandling(unittest.TestCase):
             "json" in candidates[0].fact.lower()
             or "parse" in candidates[0].fact.lower(),
             f"failure reason should mention JSON parse error: {candidates[0].fact}",
+        )
+
+    @mock.patch("pipeline.classifier.subprocess.run")
+    def test_nonzero_exit_message_includes_stdout(self, mock_run):
+        """When `claude -p` exits non-zero with the error on STDOUT (not
+        stderr), the resulting marker's failure reason MUST include that
+        stdout content. Otherwise the failure surfaces as a misleading
+        "(no stderr)" annotation that hides the real diagnostic.
+
+        WHY this matters (2026-05-14 bug A symptom):
+        Under `--output-format json`, `claude -p` commonly writes its
+        error envelope to STDOUT (not stderr). The user observed every
+        marker reading `Classifier failed: claude -p exited 1: (no stderr)`
+        because the implementation only captured stderr in the error
+        message — stdout was discarded for failure cases. The actual
+        message "Credit balance is too low" (which would have made the
+        root cause instantly diagnosable) was lost.
+        """
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=1,
+            stdout="Credit balance is too low",
+            stderr="",
+        )
+        candidates = self.clf.classify(
+            turn_text="long substantive turn text " * 20,
+            session_id="s", cwd="/c", excerpt="e",
+        )
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0].title, "[FAILURE] classifier")
+        self.assertIn(
+            "Credit balance",
+            candidates[0].fact,
+            f"marker's fact must surface stdout-side error content "
+            f"so the user can diagnose without grepping the parent terminal: "
+            f"got {candidates[0].fact!r}",
+        )
+
+    @mock.patch("pipeline.classifier.subprocess.run")
+    def test_nonzero_exit_message_includes_both_streams_when_present(self, mock_run):
+        """When BOTH stdout and stderr are non-empty on a non-zero exit,
+        both must appear in the failure reason. Some `claude -p` failures
+        emit structured JSON on stdout AND a human-readable line on stderr;
+        we want both signals reaching the user's review queue.
+        """
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=2,
+            stdout='{"is_error": true, "result": "rate limited"}',
+            stderr="429 Too Many Requests",
+        )
+        candidates = self.clf.classify(
+            turn_text="long substantive turn text " * 20,
+            session_id="s", cwd="/c", excerpt="e",
+        )
+        self.assertEqual(len(candidates), 1)
+        fact = candidates[0].fact
+        # Sanitization truncates fact to ~200 chars; both signals must
+        # remain visible inside that budget. We assert substrings that
+        # are short enough to fit even after _sanitize.
+        self.assertIn(
+            "rate limited", fact,
+            f"stdout content must appear in marker fact: {fact!r}",
+        )
+        self.assertIn(
+            "429", fact,
+            f"stderr content must appear in marker fact: {fact!r}",
         )
 
     @mock.patch("pipeline.classifier.subprocess.run")

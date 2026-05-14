@@ -71,12 +71,23 @@ else
     PROJECT_DIR="${PROJECT_DIR:-${CLAUDE_PROJECT_DIR:-$PWD}}"
 fi
 
-if [[ -z "$TRANSCRIPT" || ! -f "$TRANSCRIPT" ]]; then
-    log "no transcript at transcript_path=$TRANSCRIPT — skip"
-    # PREFILTER_ONLY mode: no transcript → prefilter fails (exit 1)
+if [[ -z "$TRANSCRIPT" ]]; then
+    # No path resolved at all (neither stdin JSON nor env-var fallback).
+    # Nothing to retry against — bail immediately.
+    log "no transcript path resolved — skip"
     [[ "${PREFILTER_ONLY:-0}" == "1" ]] && exit 1
     exit 0
 fi
+
+# NOTE: presence of the transcript FILE is checked inside the retry loop
+# below (see "JSONL write-flush race retry" section). 2026-05-14 change:
+# the missing-file case is no longer an early-exit; it gets the same
+# retry budget as the empty-file case, because in practice Claude Code
+# sometimes emits the Stop hook event slightly BEFORE the transcript
+# file is first created on disk. Log analysis from
+# ~/.claude/logs/observe-learning-capture.log showed ~92 "no transcript"
+# bailouts vs ~54 successful prefilter-pass events over recent weeks —
+# many of those 92 were almost certainly resolvable file-creation races.
 
 # ---------------------------------------------------------------------------
 # Extract the CURRENT LOGICAL TURN text via jq (mirrors Python's
@@ -153,44 +164,70 @@ extract_turn_text() {
     ' "$1" 2>/dev/null || true
 }
 
-TURN_TEXT=$(extract_turn_text "$TRANSCRIPT")
-
 # ---------------------------------------------------------------------------
-# JSONL write-flush race retry (added 2026-05-11).
+# JSONL write-flush + file-existence race retry.
 #
-# Problem observed in production: Claude Code emits the Stop hook event
-# at assistant-turn end, but the JSONL transcript may not be fully
-# flushed to disk at that exact moment. The walker reads an empty or
-# partial file and returns "" — the hook then logs
-# "no assistant turn extracted — skip" and the classifier never runs
-# for that turn. This means real Observe-platform learnings on
-# substantive turns silently fail to be captured.
+# Original problem (2026-05-11): Claude Code emits the Stop hook event at
+# assistant-turn end, but the JSONL transcript may not be fully flushed to
+# disk at that exact moment. The walker reads an empty or partial file and
+# returns "" — the hook then logs "no assistant turn extracted — skip" and
+# the classifier never runs.
 #
-# Fix: retry on empty result. Each retry sleeps STOP_HOOK_RETRY_DELAY
-# seconds (default 0.2s) then re-walks the transcript. Up to
-# STOP_HOOK_MAX_RETRIES retries (default 3) — so worst-case ~600ms
-# additional wall time, still safely below the hook's overall budget.
+# 2026-05-14 expansion: empirically, the file sometimes does not EXIST at
+# all at hook-fire time — it gets created shortly after. The previous code
+# had a hard early-exit on `! -f "$TRANSCRIPT"` BEFORE entering this loop,
+# so missing-file races bypassed the retry budget entirely. Log analysis
+# showed 92 "no transcript" bailouts vs 54 prefilter-pass successes
+# recently; many of those 92 were almost certainly resolvable races.
+#
+# Fix: retry on EITHER missing file OR empty extraction. Each retry sleeps
+# STOP_HOOK_RETRY_DELAY seconds (default 0.2s). Up to STOP_HOOK_MAX_RETRIES
+# retries (default 3) — worst-case ~600ms additional wall time, still well
+# below the hook's overall budget. The classifier is backgrounded with `&`
+# at the end of this script, so this retry budget is not visible to the
+# user even when it fires.
 #
 # We log only when retries actually recovered content, so the log shows
-# how often the race bites in practice and the cost of the workaround.
+# how often each race bites in practice and the cost of the workaround.
 # ---------------------------------------------------------------------------
+TURN_TEXT=""
 RETRY_COUNT=0
 MAX_RETRIES="${STOP_HOOK_MAX_RETRIES:-3}"
 RETRY_DELAY="${STOP_HOOK_RETRY_DELAY:-0.2}"
-while [[ -z "$TURN_TEXT" && $RETRY_COUNT -lt $MAX_RETRIES ]]; do
-    RETRY_COUNT=$((RETRY_COUNT + 1))
-    sleep "$RETRY_DELAY"
-    TURN_TEXT=$(extract_turn_text "$TRANSCRIPT")
+
+# Loop bound is MAX_RETRIES + 1 attempts: one initial try, then up to
+# MAX_RETRIES retries. We attempt extraction iff the file exists; on
+# missing-file (or empty-extract) we sleep and retry.
+ATTEMPT=0
+while (( ATTEMPT <= MAX_RETRIES )); do
+    if [[ -f "$TRANSCRIPT" ]]; then
+        TURN_TEXT=$(extract_turn_text "$TRANSCRIPT")
+        [[ -n "$TURN_TEXT" ]] && break
+    fi
+    # Either file is missing or extraction returned empty; sleep and retry
+    # UNLESS we've already burned all retries.
+    if (( ATTEMPT < MAX_RETRIES )); then
+        sleep "$RETRY_DELAY"
+        RETRY_COUNT=$((RETRY_COUNT + 1))
+    fi
+    ATTEMPT=$((ATTEMPT + 1))
 done
 
 if (( RETRY_COUNT > 0 )) && [[ -n "$TURN_TEXT" ]]; then
-    log "extracted turn after $RETRY_COUNT retry/ies (JSONL flush race)"
+    # Differentiate the two race types in the log so we can tune retry
+    # delay / max-retries based on which is hitting more.
+    log "extracted turn after $RETRY_COUNT retry/ies (transcript race)"
 fi
 
 if [[ -z "$TURN_TEXT" ]]; then
-    # No assistant turn in this transcript yet — nothing to classify.
+    # Either the file never appeared or it remained empty through the
+    # entire retry window. Nothing actionable; skip cleanly.
+    if [[ ! -f "$TRANSCRIPT" ]]; then
+        log "no transcript at transcript_path=$TRANSCRIPT after $RETRY_COUNT retry/ies — skip"
+    else
+        log "no assistant turn extracted after $RETRY_COUNT retry/ies — skip"
+    fi
     [[ "${PREFILTER_ONLY:-0}" == "1" ]] && exit 1
-    log "no assistant turn extracted — skip"
     exit 0
 fi
 

@@ -17,8 +17,15 @@ emitted a `[FAILURE] classifier` marker instead of doing real work.
 
 Pivoting to `claude -p` lets the call inherit the user's existing MAX
 subscription credentials from the surrounding Claude Code session via
-the macOS keychain. Trade-offs (accepted by design committee on
-2026-05-08):
+the macOS keychain — BUT ONLY IF the subprocess does not also inherit
+ANTHROPIC_API_KEY from the parent process's environment. The CLI's auth
+chain prefers env-var auth over keychain auth, so an inherited env var
+silently overrides the subscription path. As of 2026-05-14 (Bug A fix),
+`_invoke_classifier` explicitly strips ANTHROPIC_API_KEY and
+ANTHROPIC_AUTH_TOKEN from the subprocess env before fork — that is the
+actual mechanism guaranteeing keychain auth wins.
+
+Trade-offs (accepted by design committee on 2026-05-08):
   - Cache-control markers are not exposed by the CLI; we lose the
     fine-grained per-block ephemeral-cache strategy the SDK supported.
   - Token usage data is not consistently extractable in a stable shape,
@@ -551,6 +558,31 @@ def _invoke_classifier(
     # subscription 5-hour rolling window (shared with their interactive
     # Claude Code usage). Per the 2026-05-08 user direction, this is
     # acceptable; no per-day rate limiter is enforced at this layer.
+    #
+    # 2026-05-14 Bug A fix: strip Anthropic env vars before the subprocess
+    # fork so `claude -p` falls through to the macOS keychain credential
+    # the parent Claude Code session uses. ANTHROPIC_API_KEY (and the
+    # less-common ANTHROPIC_AUTH_TOKEN) take precedence over the keychain
+    # in `claude`'s auth-resolution chain — without this strip, an env var
+    # set in the user's shell (e.g. for other tools that need API-tier
+    # access) silently steers `claude -p` onto the API tier instead of
+    # the MAX subscription. If that tier has zero credit, every classifier
+    # call fails with "Credit balance is too low" and the entire learning
+    # pipeline goes inert.
+    #
+    # The bash hook (`stop-hook.sh`) also does `unset ANTHROPIC_API_KEY`
+    # before forking the Python pipeline, but the /observe-capture slash
+    # command, the test suite, and any future caller will bypass that
+    # mitigation. Stripping at the subprocess boundary is the defense-in-
+    # depth layer that covers every call site uniformly.
+    #
+    # Hard rule from global CLAUDE.md (Anthropic API Key Policy):
+    # all Anthropic model invocations go through MAX subscription, never
+    # via ANTHROPIC_API_KEY. This subprocess.run is one such invocation.
+    subprocess_env = os.environ.copy()
+    for var in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
+        subprocess_env.pop(var, None)
+
     proc = subprocess.run(
         argv,
         input=user_message,           # R2: pass via stdin to dodge ARG_MAX
@@ -558,17 +590,32 @@ def _invoke_classifier(
         text=True,
         timeout=_CLAUDE_P_TIMEOUT_SECONDS,
         check=False,                  # we inspect returncode below
+        env=subprocess_env,           # 2026-05-14 Bug A: keychain auth, not env-var auth
     )
 
     if proc.returncode != 0:
-        # Truncate stderr aggressively — the CLI may emit verbose context
-        # (auth failure messages with installation hints, etc.) and we want
-        # a marker that is YAML-safe and human-readable. The marker layer's
-        # _sanitize() also caps to 200 chars, but trimming here keeps the
-        # raised exception message itself bounded.
+        # 2026-05-14 Bug A fix part 2: capture BOTH stdout and stderr in
+        # the failure reason. Under `--output-format json`, `claude -p`
+        # often emits structured error envelopes to stdout (not stderr) —
+        # the previous stderr-only message produced the misleading
+        # "(no stderr)" annotation that masked diagnostics like
+        # "Credit balance is too low".
+        #
+        # Truncate each stream to 300 chars: the CLI may emit verbose
+        # context (auth failure messages with installation hints, etc.)
+        # and we want a marker that is YAML-safe and human-readable. The
+        # marker layer's _sanitize() also caps to 200 chars, but trimming
+        # here keeps the raised exception message itself bounded.
         truncated_stderr = (proc.stderr or "").strip()[:300]
+        truncated_stdout = (proc.stdout or "").strip()[:300]
+        diagnostic_parts: list[str] = []
+        if truncated_stderr:
+            diagnostic_parts.append(f"stderr: {truncated_stderr}")
+        if truncated_stdout:
+            diagnostic_parts.append(f"stdout: {truncated_stdout}")
+        diagnostic = " | ".join(diagnostic_parts) or "(no output)"
         raise RuntimeError(
-            f"claude -p exited {proc.returncode}: {truncated_stderr or '(no stderr)'}"
+            f"claude -p exited {proc.returncode}: {diagnostic}"
         )
 
     # The CLI's JSON envelope is documented to put the assistant text at
