@@ -73,9 +73,30 @@ own line.
 
 # Already known facts (do not re-capture)
 
-The user will provide a slim list of section headers and dedup-key id hashes
-already captured. Treat any candidate whose normalized fact would produce
-an id already in that list as a duplicate — do not propose it.
+The user will provide BOTH (a) a slim list of section headers and dedup-key
+id hashes already captured, and (b) the full text of the "Already known"
+knowledge base where applicable. Treat a candidate as a duplicate — and
+return `[]` for it — in any of these cases:
+
+1. **Hash match.** Its normalized fact would produce an id already in the
+   slim id list.
+2. **Verbatim match.** Its fact text appears nearly identical to a bullet
+   already in the Already-known content.
+3. **Semantic match.** A reader who knew the Already-known content would
+   read the new turn and say "yes, that's the thing we already wrote down,
+   just phrased differently."
+
+Examples of semantic matches that MUST be suppressed:
+- Turn says "OPAL rejects '7d' as a time literal; use '168h'"
+  Already known says "OPAL rejects '7d' as a time literal; use '168h'. Also '14d' → '336h'."
+  → return `[]`; the longer Already-known entry covers the new turn.
+- Turn says "the API requires X-Token header"
+  Already known says "Authentication uses the X-Token header on all endpoints"
+  → return `[]`.
+
+When in doubt between "new nuance" and "restatement of known fact", PREFER
+suppression. Re-capture noise costs the human reviewer attention; a missed
+nuance can be re-captured later when it reappears with more context.
 
 ---
 
