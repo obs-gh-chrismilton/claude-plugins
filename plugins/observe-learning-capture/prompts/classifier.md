@@ -86,17 +86,22 @@ return `[]` for it — in any of these cases:
    read the new turn and say "yes, that's the thing we already wrote down,
    just phrased differently."
 
-Examples of semantic matches that MUST be suppressed:
-- Turn says "OPAL rejects '7d' as a time literal; use '168h'"
-  Already known says "OPAL rejects '7d' as a time literal; use '168h'. Also '14d' → '336h'."
-  → return `[]`; the longer Already-known entry covers the new turn.
-- Turn says "the API requires X-Token header"
+Example of a semantic match that MUST be suppressed:
+- Turn says "the API requires the X-Token header on all calls"
   Already known says "Authentication uses the X-Token header on all endpoints"
-  → return `[]`.
+  → return `[]`; the existing bullet covers the new turn.
 
-When in doubt between "new nuance" and "restatement of known fact", PREFER
-suppression. Re-capture noise costs the human reviewer attention; a missed
-nuance can be re-captured later when it reappears with more context.
+**Critical:** the suppression check only fires when the Already-known content
+ACTUALLY discusses the same subsystem as the new turn. A turn about OPAL
+syntax is NEVER suppressed by an Already-known entry about GraphQL. A turn
+about CLI flags is NEVER suppressed by an Already-known entry about API
+authentication. Always read the Already-known content first; if it does
+not name the same subsystem, capture the new fact.
+
+When in doubt between "new nuance of a known fact" and "restatement of a
+known fact" — and only after confirming the Already-known content addresses
+the same subsystem — PREFER suppression. Re-capture noise costs the human
+reviewer attention; a missed nuance can be re-captured later.
 
 ---
 
