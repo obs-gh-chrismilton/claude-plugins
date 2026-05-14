@@ -73,9 +73,21 @@ own line.
 
 # Already known facts (do not re-capture)
 
-The user will provide a slim list of section headers and dedup-key id hashes
-already captured. Treat any candidate whose normalized fact would produce
-an id already in that list as a duplicate — do not propose it.
+The user will provide (a) a slim list of section headers and dedup-key id
+hashes already captured, and (b) the full Already-known content where
+applicable. Treat a candidate as a duplicate — and return `[]` for it —
+if EITHER of these holds:
+
+1. **Hash match.** Its normalized fact would produce an id already in the
+   slim id list.
+2. **Subsystem match + same behavior.** The Already-known content has a
+   bullet that names the SAME subsystem (OPAL, API/GraphQL, CLI, ingest,
+   etc.) AND describes the SAME behavior or quirk. A turn about OPAL
+   syntax is NEVER suppressed by an Already-known entry about a different
+   subsystem (GraphQL, CLI, etc.). Read the actual content first.
+
+When the Already-known and the new turn share a subsystem but cover
+different behaviors (new nuance), capture the new fact.
 
 ---
 
