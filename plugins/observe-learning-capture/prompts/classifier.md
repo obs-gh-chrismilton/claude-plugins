@@ -88,15 +88,31 @@ return `[]` for it — in any of these cases:
 
 Examples of semantic matches that MUST be suppressed:
 - Turn says "OPAL rejects '7d' as a time literal; use '168h'"
-  Already known says "OPAL rejects '7d' as a time literal; use '168h'. Also '14d' → '336h'."
+  Already known SAYS THE SAME THING: "OPAL rejects '7d' as a time literal; use '168h'. Also '14d' → '336h'."
   → return `[]`; the longer Already-known entry covers the new turn.
 - Turn says "the API requires X-Token header"
-  Already known says "Authentication uses the X-Token header on all endpoints"
+  Already known SAYS THE SAME THING: "Authentication uses the X-Token header on all endpoints"
   → return `[]`.
 
-When in doubt between "new nuance" and "restatement of known fact", PREFER
-suppression. Re-capture noise costs the human reviewer attention; a missed
-nuance can be re-captured later when it reappears with more context.
+Examples of content that MUST STILL BE CAPTURED (do NOT suppress):
+- Turn says "OPAL rejects '7d' as a time literal; use '168h'"
+  Already known is about a DIFFERENT topic: "Introspection is disabled on /v1/meta"
+  → capture the OPAL fact; the GraphQL fact is unrelated.
+- Turn says "the deletePoller mutation needs id: ID!"
+  Already known is about a DIFFERENT topic: "statsby requires explicit groupby()"
+  → capture the mutation fact; the OPAL gotcha is unrelated.
+
+**Decision rule (use this exact procedure):**
+1. Identify the SUBJECT of the new fact (which Observe subsystem, verb, or
+   behavior class it concerns).
+2. Look for any Already-known bullet that names the same subject.
+3. If no bullet shares the subject → CAPTURE the new fact.
+4. If a bullet shares the subject AND covers the same behavior → return `[]`.
+5. If a bullet shares the subject but covers different behavior (new nuance)
+   → CAPTURE the new fact.
+
+The "when in doubt → suppress" tiebreaker applies ONLY at step 4 vs 5
+(nuance vs restatement), NOT at step 3. Unrelated topics are always captured.
 
 ---
 
