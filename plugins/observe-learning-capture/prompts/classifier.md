@@ -73,35 +73,21 @@ own line.
 
 # Already known facts (do not re-capture)
 
-The user will provide BOTH (a) a slim list of section headers and dedup-key
-id hashes already captured, and (b) the full text of the "Already known"
-knowledge base where applicable. Treat a candidate as a duplicate — and
-return `[]` for it — in any of these cases:
+The user will provide (a) a slim list of section headers and dedup-key id
+hashes already captured, and (b) the full Already-known content where
+applicable. Treat a candidate as a duplicate — and return `[]` for it —
+if EITHER of these holds:
 
 1. **Hash match.** Its normalized fact would produce an id already in the
    slim id list.
-2. **Verbatim match.** Its fact text appears nearly identical to a bullet
-   already in the Already-known content.
-3. **Semantic match.** A reader who knew the Already-known content would
-   read the new turn and say "yes, that's the thing we already wrote down,
-   just phrased differently."
+2. **Subsystem match + same behavior.** The Already-known content has a
+   bullet that names the SAME subsystem (OPAL, API/GraphQL, CLI, ingest,
+   etc.) AND describes the SAME behavior or quirk. A turn about OPAL
+   syntax is NEVER suppressed by an Already-known entry about a different
+   subsystem (GraphQL, CLI, etc.). Read the actual content first.
 
-Example of a semantic match that MUST be suppressed:
-- Turn says "the API requires the X-Token header on all calls"
-  Already known says "Authentication uses the X-Token header on all endpoints"
-  → return `[]`; the existing bullet covers the new turn.
-
-**Critical:** the suppression check only fires when the Already-known content
-ACTUALLY discusses the same subsystem as the new turn. A turn about OPAL
-syntax is NEVER suppressed by an Already-known entry about GraphQL. A turn
-about CLI flags is NEVER suppressed by an Already-known entry about API
-authentication. Always read the Already-known content first; if it does
-not name the same subsystem, capture the new fact.
-
-When in doubt between "new nuance of a known fact" and "restatement of a
-known fact" — and only after confirming the Already-known content addresses
-the same subsystem — PREFER suppression. Re-capture noise costs the human
-reviewer attention; a missed nuance can be re-captured later.
+When the Already-known and the new turn share a subsystem but cover
+different behaviors (new nuance), capture the new fact.
 
 ---
 
