@@ -1,10 +1,10 @@
 {
-  "name": "chris-plugins",
+  "name": "observe-ie-marketplace",
   "owner": {
     "name": "Chris Milton"
   },
   "metadata": {
-    "description": "Chris Milton's personal Claude Code plugins"
+    "description": "Observe IE Marketplace — plugins for Observe Integration Engineering work (knowledge capture, query optimization, dashboard design + migration, brand assets)."
   },
   "plugins": [
     {
