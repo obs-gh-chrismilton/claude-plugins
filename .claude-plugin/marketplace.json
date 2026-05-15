@@ -28,19 +28,19 @@
       "tags": ["snowflake", "brand-guidelines", "design", "presentations"]
     },
     {
-      "name": "observe-learning-capture",
+      "name": "observeie-plugin",
       "source": {
         "source": "github",
-        "repo": "obs-gh-chrismilton/observe-learning"
+        "repo": "obs-gh-chrismilton/observeie-plugin"
       },
-      "description": "Auto-captures Observe-platform learnings from session transcripts; stages for review; promotes approved candidates into ObserveIE.md for cross-customer propagation",
-      "homepage": "https://github.com/obs-gh-chrismilton/observe-learning",
-      "repository": "https://github.com/obs-gh-chrismilton/observe-learning",
+      "description": "Observe IE bundle — ObserveIE agent + Dashboard Designer + Dashboard Migrator + Observe CLI skill + auto-learning capture pipeline. The single plugin for the full Observe Integration Engineer workflow.",
+      "homepage": "https://github.com/obs-gh-chrismilton/observeie-plugin",
+      "repository": "https://github.com/obs-gh-chrismilton/observeie-plugin",
       "author": {
         "name": "Chris Milton"
       },
-      "category": "knowledge-management",
-      "tags": ["observe", "learning-capture", "subscription-auth", "hooks", "classifier", "cross-customer-knowledge"]
+      "category": "observe-platform",
+      "tags": ["observe", "observe-ie", "agent", "dashboard-designer", "dashboard-migrator", "observe-cli", "learning-capture", "graphql", "opal"]
     }
   ]
 }
