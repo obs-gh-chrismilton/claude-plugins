@@ -41,6 +41,21 @@
       },
       "category": "observe-platform",
       "tags": ["observe", "observe-ie", "agent", "dashboard-designer", "dashboard-migrator", "observe-cli", "learning-capture", "graphql", "opal"]
+    },
+    {
+      "name": "observeie-plugin-v2",
+      "source": {
+        "source": "github",
+        "repo": "obs-gh-chrismilton/observeie-plugin-v2"
+      },
+      "description": "Observe IE bundle v2 — everything in observeie-plugin PLUS a 7-phase safety harness: tenant guardrails, destructive-op approval tokens, multi-agent widget validation (Builder/Validator/Skeptic), parallel build with layout agent, auto-review with undo window, dataset-creation workflow, and knowledge-graph detection. Install side-by-side with v1 to A/B test.",
+      "homepage": "https://github.com/obs-gh-chrismilton/observeie-plugin-v2",
+      "repository": "https://github.com/obs-gh-chrismilton/observeie-plugin-v2",
+      "author": {
+        "name": "Chris Milton"
+      },
+      "category": "observe-platform",
+      "tags": ["observe", "observe-ie", "agent", "harness", "tenant-guardrails", "dashboard-designer", "dashboard-migrator", "observe-cli", "learning-capture", "graphql", "opal"]
     }
   ]
 }
