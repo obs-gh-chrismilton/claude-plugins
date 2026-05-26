@@ -56,6 +56,51 @@
       },
       "category": "observe-platform",
       "tags": ["observe", "observe-ie", "agent", "harness", "tenant-guardrails", "dashboard-designer", "dashboard-migrator", "observe-cli", "learning-capture", "graphql", "opal"]
+    },
+    {
+      "name": "observe-learning",
+      "source": {
+        "source": "github",
+        "repo": "obs-gh-chrismilton/observe-learning"
+      },
+      "description": "Auto-capture Observe-platform learnings from Claude Code sessions for cross-customer knowledge propagation. Stop-hook classifier + /observe-capture + /observe-review slash commands.",
+      "homepage": "https://github.com/obs-gh-chrismilton/observe-learning",
+      "repository": "https://github.com/obs-gh-chrismilton/observe-learning",
+      "author": {
+        "name": "Chris Milton"
+      },
+      "category": "observe-platform",
+      "tags": ["observe", "learning-capture", "knowledge-propagation", "stop-hook", "auto-classifier"]
+    },
+    {
+      "name": "dashboard-designer",
+      "source": {
+        "source": "github",
+        "repo": "obs-gh-chrismilton/dashboard-designer"
+      },
+      "description": "Design Observe dashboards from intent. Carries verified vegaVis shapes, 12-column grid conventions, OPAL idioms per viz type, drill-down patterns, and the schema-first → deploy → screenshot-verify workflow.",
+      "homepage": "https://github.com/obs-gh-chrismilton/dashboard-designer",
+      "repository": "https://github.com/obs-gh-chrismilton/dashboard-designer",
+      "author": {
+        "name": "Chris Milton"
+      },
+      "category": "observe-platform",
+      "tags": ["observe", "dashboard", "opal", "vega", "design"]
+    },
+    {
+      "name": "dashboard-migrator",
+      "source": {
+        "source": "github",
+        "repo": "obs-gh-chrismilton/DashboardMigrator"
+      },
+      "description": "Translate Datadog dashboard JSON exports into working Observe dashboards. Encodes dataset-shape dispatch, DD APM idioms, DD query grammar → OPAL mapping, and vegaVis wiring quirks. Hands off to dashboard-designer for final polish.",
+      "homepage": "https://github.com/obs-gh-chrismilton/DashboardMigrator",
+      "repository": "https://github.com/obs-gh-chrismilton/DashboardMigrator",
+      "author": {
+        "name": "Chris Milton"
+      },
+      "category": "observe-platform",
+      "tags": ["observe", "dashboard", "datadog", "migration", "opal"]
     }
   ]
 }
