@@ -30,8 +30,9 @@
     {
       "name": "observeie-plugin",
       "source": {
-        "source": "github",
-        "repo": "obs-gh-chrismilton/observeie-plugin"
+        "source": "url",
+        "url": "https://github.com/obs-gh-chrismilton/observeie-plugin.git",
+        "ref": "main"
       },
       "description": "Observe IE bundle — ObserveIE agent + Dashboard Designer + Dashboard Migrator + Observe CLI skill + auto-learning capture pipeline. The single plugin for the full Observe Integration Engineer workflow.",
       "homepage": "https://github.com/obs-gh-chrismilton/observeie-plugin",
@@ -45,8 +46,9 @@
     {
       "name": "observeie-plugin-v2",
       "source": {
-        "source": "github",
-        "repo": "obs-gh-chrismilton/observeie-plugin-v2"
+        "source": "url",
+        "url": "https://github.com/obs-gh-chrismilton/observeie-plugin-v2.git",
+        "ref": "main"
       },
       "description": "Observe IE bundle v2 — everything in observeie-plugin PLUS a 7-phase safety harness: tenant guardrails, destructive-op approval tokens, multi-agent widget validation (Builder/Validator/Skeptic), parallel build with layout agent, auto-review with undo window, dataset-creation workflow, and knowledge-graph detection. Install side-by-side with v1 to A/B test.",
       "homepage": "https://github.com/obs-gh-chrismilton/observeie-plugin-v2",
@@ -60,8 +62,9 @@
     {
       "name": "observe-learning",
       "source": {
-        "source": "github",
-        "repo": "obs-gh-chrismilton/observe-learning"
+        "source": "url",
+        "url": "https://github.com/obs-gh-chrismilton/observe-learning.git",
+        "ref": "main"
       },
       "description": "Auto-capture Observe-platform learnings from Claude Code sessions for cross-customer knowledge propagation. Stop-hook classifier + /observe-capture + /observe-review slash commands.",
       "homepage": "https://github.com/obs-gh-chrismilton/observe-learning",
@@ -75,8 +78,9 @@
     {
       "name": "dashboard-designer",
       "source": {
-        "source": "github",
-        "repo": "obs-gh-chrismilton/dashboard-designer"
+        "source": "url",
+        "url": "https://github.com/obs-gh-chrismilton/dashboard-designer.git",
+        "ref": "main"
       },
       "description": "Design Observe dashboards from intent. Carries verified vegaVis shapes, 12-column grid conventions, OPAL idioms per viz type, drill-down patterns, and the schema-first → deploy → screenshot-verify workflow.",
       "homepage": "https://github.com/obs-gh-chrismilton/dashboard-designer",
@@ -90,8 +94,9 @@
     {
       "name": "dashboard-migrator",
       "source": {
-        "source": "github",
-        "repo": "obs-gh-chrismilton/DashboardMigrator"
+        "source": "url",
+        "url": "https://github.com/obs-gh-chrismilton/DashboardMigrator.git",
+        "ref": "main"
       },
       "description": "Translate Datadog dashboard JSON exports into working Observe dashboards. Encodes dataset-shape dispatch, DD APM idioms, DD query grammar → OPAL mapping, and vegaVis wiring quirks. Hands off to dashboard-designer for final polish.",
       "homepage": "https://github.com/obs-gh-chrismilton/DashboardMigrator",
